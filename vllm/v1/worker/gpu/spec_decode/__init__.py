@@ -9,6 +9,16 @@ def init_speculator(vllm_config: VllmConfig, device: torch.device):
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
     if speculative_config.method == "dflash":
+        draft_config = getattr(
+            speculative_config.draft_model_config.hf_config, "dflash_config", {}
+        ) or {}
+        if draft_config.get("projector_type") == "domino":
+            from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
+                DominoDFlashSpeculator,
+            )
+
+            return DominoDFlashSpeculator(vllm_config, device)
+
         from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
             DFlashSpeculator,
         )

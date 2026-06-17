@@ -22,6 +22,7 @@ from vllm.v1.worker.gpu.spec_decode.dflash.utils import (
     get_dflash_causal,
     load_dflash_model,
 )
+from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 from vllm.v1.worker.gpu.spec_decode.utils import get_parallel_drafting_token_id
 
@@ -368,6 +369,108 @@ class DFlashSpeculator(DraftModelSpeculator):
             )
 
         return self.draft_tokens[:num_reqs]
+
+
+class DominoDFlashSpeculator(DFlashSpeculator):
+    """DFlash speculator with the Domino causal correction head.
+
+    The parallel DFlash backbone forward is reused, but token sampling is
+    performed sequentially: the first ``pure_draft_prefix_len`` speculative
+    tokens are sampled from the backbone logits, and subsequent tokens use
+    GRU-conditioned logit corrections.
+
+    Because Domino sampling is inherently sequential, CUDA graphs are disabled
+    for the Domino head; only the backbone forward could be captured, and the
+    current implementation falls back to eager execution to keep the logic
+    simple and correct.
+    """
+
+    def __init__(self, vllm_config: VllmConfig, device: torch.device):
+        super().__init__(vllm_config, device)
+        model = self.model.model
+        assert getattr(model, "projector_type", None) == "domino", (
+            "DominoDFlashSpeculator requires dflash_config.projector_type='domino'"
+        )
+        self.pure_draft_prefix_len = int(getattr(model, "pure_draft_prefix_len", 0))
+        self.gru_hidden_dim = int(model.gru_hidden_dim)
+
+    def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
+        # Domino sampling is sequential; do not capture it in a CUDA graph.
+        self.query_cudagraph_manager = None
+
+    def _generate_draft(
+        self,
+        num_reqs: int,
+        num_tokens_padded: int,
+        attn_metadata: dict[str, Any] | None,
+        slot_mappings: dict[str, torch.Tensor] | None,
+        num_tokens_across_dp: torch.Tensor | None,
+        cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+    ) -> None:
+        last_hidden_states = self._run_model(
+            num_tokens_padded,
+            attn_metadata,
+            slot_mappings,
+            num_tokens_across_dp,
+            cudagraph_runtime_mode,
+        )
+
+        # View the query hidden states as [num_reqs, num_query_per_req, hidden].
+        num_query_tokens = num_reqs * self.num_query_per_req
+        hidden_3d = last_hidden_states[:num_query_tokens].view(
+            num_reqs, self.num_query_per_req, self.hidden_size
+        )
+        input_ids_2d = self.input_buffers.input_ids[:num_query_tokens].view(
+            num_reqs, self.num_query_per_req
+        )
+        positions_2d = self.input_buffers.positions[:num_query_tokens].view(
+            num_reqs, self.num_query_per_req
+        )
+
+        # Output buffer for this propose step.
+        draft_tokens = self.draft_tokens[:num_reqs]
+        draft_logits = self.draft_logits
+
+        for req_idx in range(num_reqs):
+            # The bonus token at query position 0 seeds the Domino GRU state.
+            bonus_token = input_ids_2d[req_idx, 0]
+            gru_state = self.model.update_domino_gru_state(
+                bonus_token.unsqueeze(0), None
+            )
+
+            for step in range(self.num_speculative_steps):
+                query_pos = step + 1
+                hidden = hidden_3d[req_idx, query_pos, :].unsqueeze(0)
+
+                if step < self.pure_draft_prefix_len:
+                    logits = self.model.compute_logits(hidden)
+                else:
+                    logits, gru_state = self.model.compute_domino_logits(
+                        hidden, gru_state
+                    )
+
+                if draft_logits is not None:
+                    token = gumbel_sample(
+                        logits,
+                        self.idx_mapping[req_idx].unsqueeze(0),
+                        self.temperature,
+                        self.seeds,
+                        positions_2d[req_idx, query_pos].unsqueeze(0) + 1,
+                        apply_temperature=True,
+                        output_processed_logits=draft_logits,
+                        output_processed_logits_col=torch.tensor(
+                            step, dtype=torch.int32, device=self.device
+                        ),
+                        use_fp64=self.use_fp64_gumbel,
+                    )
+                else:
+                    token = logits.argmax(dim=-1)
+
+                token = token.view(())
+                draft_tokens[req_idx, step] = token
+                gru_state = self.model.update_domino_gru_state(
+                    token.unsqueeze(0), gru_state
+                )
 
 
 @triton.jit
