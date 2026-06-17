@@ -283,6 +283,33 @@ class DFlashQwen3Model(nn.Module):
             eps=self.config.rms_norm_eps,
         )
 
+        # Domino: optional causal correction head on top of DFlash backbone.
+        dflash_config = getattr(self.config, "dflash_config", {}) or {}
+        self.projector_type = dflash_config.get("projector_type", None)
+        self.pure_draft_prefix_len = dflash_config.get(
+            "pure_draft_prefix_len", 0)
+        self.shift_label = dflash_config.get("shift_label", False)
+
+        if self.projector_type == "domino":
+            self.emb_dim = dflash_config["emb_dim"]
+            self.gru_hidden_dim = dflash_config["gru_hidden_dim"]
+            self.prefix_gru = nn.GRU(
+                input_size=self.config.hidden_size,
+                hidden_size=self.gru_hidden_dim,
+                num_layers=1,
+                batch_first=True,
+                bias=False,
+            )
+            in_dim = self.config.hidden_size + self.gru_hidden_dim
+            self.embed_proj = nn.Sequential(
+                nn.Linear(in_dim, self.emb_dim, bias=False),
+                nn.SiLU(),
+                nn.Linear(self.emb_dim, self.config.vocab_size, bias=False),
+            )
+        elif self.projector_type is not None:
+            raise ValueError(
+                f"Unknown DFlash projector_type: {self.projector_type}")
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -555,6 +582,63 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         logits_new[:, targets] = logits
         return logits_new
 
+    @property
+    def domino_enabled(self) -> bool:
+        return getattr(self.model, "projector_type", None) == "domino"
+
+    def compute_domino_logits(
+        self,
+        hidden_states: torch.Tensor,
+        gru_state: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply the Domino causal correction head to compute corrected logits.
+
+        Args:
+            hidden_states: Draft hidden state for the current query token,
+                shape ``[hidden_size]`` or ``[1, hidden_size]``.
+            gru_state: GRU hidden state that already encodes all previously
+                sampled tokens, shape ``[num_layers, batch, gru_hidden_dim]``.
+
+        Returns:
+            A tuple of ``(logits, gru_state)``. ``logits`` has shape
+            ``[1, vocab_size]`` and ``gru_state`` is unchanged.
+        """
+        model = self.model
+        assert model.projector_type == "domino"
+
+        if hidden_states.dim() == 1:
+            hidden_states = hidden_states.unsqueeze(0)
+
+        # Compute a residual logit correction and add it to the base logits.
+        concat = torch.cat([hidden_states, gru_state[-1, :, :]], dim=-1)
+        bias = model.embed_proj(concat)
+        base_logits = self.compute_logits(hidden_states)
+        return base_logits + bias, gru_state
+
+    def update_domino_gru_state(
+        self,
+        token_ids: torch.Tensor,
+        gru_state: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Update the Domino GRU state with one or more sampled token IDs.
+
+        Args:
+            token_ids: Token IDs to feed into the GRU, shape ``[]`` or ``[1]``.
+            gru_state: Previous GRU hidden state, or ``None`` to initialize.
+
+        Returns:
+            Updated GRU hidden state with shape
+            ``[num_layers, 1, gru_hidden_dim]``.
+        """
+        model = self.model
+        assert model.projector_type == "domino"
+
+        if token_ids.dim() == 0:
+            token_ids = token_ids.unsqueeze(0)
+        embeds = model.embed_input_ids(token_ids).unsqueeze(1)
+        _, gru_state = model.prefix_gru(embeds, gru_state)
+        return gru_state
+
     def precompute_and_store_context_kv(
         self,
         context_states: torch.Tensor,
@@ -584,6 +668,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         model_weights = {}
         includes_draft_id_mapping = False
         includes_embed_tokens = False
+        includes_domino = False
         for name, loaded_weight in weights:
             assert "mask_hidden" not in name, (
                 "DFlash should use mask_token_id to embed the padding hidden state"
@@ -597,8 +682,16 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
                 name = "model." + name
             if "embed_tokens" in name:
                 includes_embed_tokens = True
+            if "prefix_gru" in name or "embed_proj" in name:
+                includes_domino = True
             model_weights[name] = loaded_weight
             process_eagle_weight(self, name)
+
+        if self.domino_enabled and not includes_domino:
+            raise ValueError(
+                "Domino head is enabled (dflash_config.projector_type='domino') "
+                "but the checkpoint does not contain prefix_gru/embed_proj weights."
+            )
 
         skip_substrs = []
         if not includes_draft_id_mapping:
@@ -607,6 +700,9 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             skip_substrs.append("embed_tokens")
         if not self.model.use_aux_hidden_state:
             skip_substrs.append("fc.")
+        if not self.domino_enabled:
+            skip_substrs.append("prefix_gru")
+            skip_substrs.append("embed_proj")
         loader = AutoWeightsLoader(
             self,
             skip_prefixes=None,
