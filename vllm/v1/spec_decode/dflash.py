@@ -298,3 +298,95 @@ class DFlashProposer(SpecDecodeBaseProposer):
         if dflash_config is not None:
             use_aux_hidden_state = dflash_config.get("use_aux_hidden_state", True)
         return use_aux_hidden_state
+
+
+class DominoDFlashProposer(DFlashProposer):
+    """DFlash proposer with the Domino causal correction head.
+
+    The parallel DFlash backbone forward is reused (the base class produces
+    ``num_speculative_tokens`` query hidden states per request in a single
+    forward pass). Token sampling is then performed sequentially on top of
+    those hidden states: the first ``pure_draft_prefix_len`` speculative
+    tokens are sampled from the backbone logits, and subsequent tokens use
+    GRU-conditioned logit corrections.
+
+    The bonus token (last verified token from the target model) is read from
+    the proposer's pre-populated ``input_ids`` buffer and used to seed the
+    GRU state for each request at the start of every propose call.
+    """
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        device: torch.device,
+        runner=None,
+    ):
+        super().__init__(vllm_config, device, runner)
+        # Validate that the underlying draft model exposes Domino head.
+        # The actual nn.Module is loaded in load_model() (called later);
+        # we re-check at sample time as well.
+        dflash_config = getattr(
+            self.draft_model_config.hf_config, "dflash_config", {}
+        ) or {}
+        assert dflash_config.get("projector_type") == "domino", (
+            "DominoDFlashProposer requires "
+            "dflash_config.projector_type='domino'"
+        )
+        self.pure_draft_prefix_len: int = int(
+            dflash_config.get("pure_draft_prefix_len", 0)
+        )
+
+    @override
+    def _greedy_sample(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Sample draft tokens with the Domino causal correction head.
+
+        ``hidden_states`` has shape ``[batch_size * num_speculative_tokens,
+        hidden_size]`` and is laid out so that each request occupies a
+        contiguous block of ``num_speculative_tokens`` rows. The bonus token
+        for request ``i`` lives at ``self.input_ids[i * (1 + n_spec)]``.
+        """
+        num_spec = self.num_speculative_tokens
+        total = hidden_states.shape[0]
+        assert total % num_spec == 0, (
+            f"hidden_states first dim ({total}) is not divisible by "
+            f"num_speculative_tokens ({num_spec})"
+        )
+        batch_size = total // num_spec
+        hidden_size = hidden_states.shape[-1]
+
+        # Stride between consecutive bonus tokens in the proposer's
+        # input_ids buffer. Each request reserves (1 bonus + n_spec mask)
+        # tokens contiguously.
+        bonus_stride = 1 + num_spec
+        bonus_token_ids = self.input_ids[: batch_size * bonus_stride : bonus_stride]
+
+        hidden_3d = hidden_states.view(batch_size, num_spec, hidden_size)
+        out = torch.empty(
+            batch_size * num_spec,
+            dtype=torch.long,
+            device=hidden_states.device,
+        )
+
+        prefix_len = self.pure_draft_prefix_len
+
+        for req_idx in range(batch_size):
+            # Seed the GRU state with the request's bonus token.
+            gru_state = self.model.update_domino_gru_state(
+                bonus_token_ids[req_idx].unsqueeze(0), None
+            )
+
+            for step in range(num_spec):
+                hidden = hidden_3d[req_idx, step, :]
+                if step < prefix_len:
+                    logits = self.model.compute_logits(hidden.unsqueeze(0))
+                else:
+                    logits, gru_state = self.model.compute_domino_logits(
+                        hidden, gru_state
+                    )
+                token = logits.argmax(dim=-1).view(())
+                out[req_idx * num_spec + step] = token
+                gru_state = self.model.update_domino_gru_state(
+                    token.unsqueeze(0), gru_state
+                )
+
+        return out

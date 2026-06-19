@@ -561,7 +561,22 @@ class GPUModelRunner(
             elif self.speculative_config.use_gemma4_mtp():
                 self.drafter = Gemma4Proposer(self.vllm_config, self.device, self)
             elif self.speculative_config.use_dflash():
-                self.drafter = DFlashProposer(self.vllm_config, self.device, self)
+                draft_hf_config = (
+                    self.speculative_config.draft_model_config.hf_config
+                )
+                draft_dflash_cfg = (
+                    getattr(draft_hf_config, "dflash_config", {}) or {}
+                )
+                if draft_dflash_cfg.get("projector_type") == "domino":
+                    from vllm.v1.spec_decode.dflash import DominoDFlashProposer
+
+                    self.drafter = DominoDFlashProposer(
+                        self.vllm_config, self.device, self
+                    )
+                else:
+                    self.drafter = DFlashProposer(
+                        self.vllm_config, self.device, self
+                    )
                 self.use_aux_hidden_state_outputs = True
             elif self.speculative_config.method == "suffix":
                 self.drafter = SuffixDecodingProposer(self.vllm_config)
