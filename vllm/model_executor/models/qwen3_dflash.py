@@ -298,6 +298,10 @@ class DFlashQwen3Model(nn.Module):
                 batch_first=True,
                 bias=False,
             )
+            # NPU's DynamicGRUV2 kernel only supports float16; cast the GRU
+            # weights to fp16 so the underlying op accepts them. The embed_proj
+            # below stays in the model's native dtype (bf16/fp16/fp32).
+            self.prefix_gru = self.prefix_gru.to(torch.float16)
             in_dim = self.config.hidden_size + self.gru_hidden_dim
             self.embed_proj = nn.Sequential(
                 nn.Linear(in_dim, self.emb_dim, bias=False),
@@ -619,8 +623,12 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         if hidden_states.dim() == 1:
             hidden_states = hidden_states.unsqueeze(0)
 
+        # gru_state is held in fp16 (see update_domino_gru_state); cast back to
+        # the activation dtype for the residual correction so embed_proj runs
+        # in the model's native dtype.
+        gru_last = gru_state[-1, :, :].to(hidden_states.dtype)
         # Compute a residual logit correction and add it to the base logits.
-        concat = torch.cat([hidden_states, gru_state[-1, :, :]], dim=-1)
+        concat = torch.cat([hidden_states, gru_last], dim=-1)
         bias = model.embed_proj(concat)
         base_logits = self.compute_logits(hidden_states)
         return base_logits + bias, gru_state
@@ -646,6 +654,12 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         if token_ids.dim() == 0:
             token_ids = token_ids.unsqueeze(0)
         embeds = model.embed_input_ids(token_ids).unsqueeze(1)
+        # NPU's GRU op only accepts fp16; ensure both inputs match the GRU
+        # weight dtype (set to fp16 in the model's __init__).
+        gru_dtype = model.prefix_gru.weight_ih_l0.dtype
+        embeds = embeds.to(gru_dtype)
+        if gru_state is not None:
+            gru_state = gru_state.to(gru_dtype)
         _, gru_state = model.prefix_gru(embeds, gru_state)
         return gru_state
 
