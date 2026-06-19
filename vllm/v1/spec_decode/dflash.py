@@ -335,6 +335,7 @@ class DominoDFlashProposer(DFlashProposer):
         self.pure_draft_prefix_len: int = int(
             dflash_config.get("pure_draft_prefix_len", 0)
         )
+        self.shift_label: bool = bool(dflash_config.get("shift_label", False))
 
     @override
     def _greedy_sample(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -368,6 +369,7 @@ class DominoDFlashProposer(DFlashProposer):
         )
 
         prefix_len = self.pure_draft_prefix_len
+        shift_label = self.shift_label
 
         for req_idx in range(batch_size):
             # Seed the GRU state with the request's bonus token.
@@ -377,12 +379,17 @@ class DominoDFlashProposer(DFlashProposer):
 
             for step in range(num_spec):
                 hidden = hidden_3d[req_idx, step, :]
-                if step < prefix_len:
-                    logits = self.model.compute_logits(hidden.unsqueeze(0))
-                else:
+                # SpecForge: shift_label=True applies Domino to every
+                # speculative position (suffix_start == pure_prefix). When
+                # shift_label=False the first pure_prefix positions skip the
+                # head and use bare backbone logits.
+                use_domino = shift_label or step >= prefix_len
+                if use_domino:
                     logits, gru_state = self.model.compute_domino_logits(
                         hidden, gru_state
                     )
+                else:
+                    logits = self.model.compute_logits(hidden.unsqueeze(0))
                 token = logits.argmax(dim=-1).view(())
                 out[req_idx * num_spec + step] = token
                 gru_state = self.model.update_domino_gru_state(
