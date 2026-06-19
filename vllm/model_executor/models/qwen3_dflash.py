@@ -654,6 +654,40 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         if token_ids.dim() == 0:
             token_ids = token_ids.unsqueeze(0)
         embeds = model.embed_input_ids(token_ids).unsqueeze(1)
+        # One-shot debug log to verify (a) _maybe_share_embeddings actually
+        # swapped draft.embed_tokens to the target model's embedding,
+        # (b) prefix_gru weights are non-zero (loaded), and (c) the GRU input
+        # statistics look reasonable. Controlled by attribute on the model so
+        # we only print on first call across all requests.
+        if not getattr(model, "_domino_dbg_logged", False):
+            model._domino_dbg_logged = True
+            try:
+                emb = model.embed_tokens
+                w_ih = model.prefix_gru.weight_ih_l0
+                w_hh = model.prefix_gru.weight_hh_l0
+                logger.info(
+                    "[Domino dbg] embed_tokens id=%s shape=%s dtype=%s "
+                    "weight_norm=%.4f",
+                    id(emb),
+                    tuple(emb.weight.shape),
+                    emb.weight.dtype,
+                    emb.weight.float().norm().item(),
+                )
+                logger.info(
+                    "[Domino dbg] prefix_gru weight_ih norm=%.4f weight_hh norm=%.4f "
+                    "ih_dtype=%s",
+                    w_ih.float().norm().item(),
+                    w_hh.float().norm().item(),
+                    w_ih.dtype,
+                )
+                logger.info(
+                    "[Domino dbg] token_ids=%s embeds_norm=%.4f embeds_dtype=%s",
+                    token_ids.tolist()[:8],
+                    embeds.float().norm().item(),
+                    embeds.dtype,
+                )
+            except Exception as exc:  # pragma: no cover
+                logger.warning("[Domino dbg] failed: %s", exc)
         # NPU's GRU op only accepts fp16; ensure both inputs match the GRU
         # weight dtype (set to fp16 in the model's __init__).
         gru_dtype = model.prefix_gru.weight_ih_l0.dtype
