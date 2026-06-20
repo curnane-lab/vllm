@@ -600,67 +600,45 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
     def domino_enabled(self) -> bool:
         return getattr(self.model, "projector_type", None) == "domino"
 
+    def compute_domino_bias(
+        self,
+        hidden_states: torch.Tensor,
+        gru_state: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute the Domino logit correction (bias) only.
+
+        This is separated from ``compute_domino_logits`` so that the proposer
+        can pre-compute ``base_logits`` for all speculative steps in a single
+        batched GEMM and only run the sequential GRU + embed_proj loop here.
+
+        Args:
+            hidden_states: ``[B, hidden_size]``.
+            gru_state: ``[num_layers, B, gru_hidden_dim]`` (fp16 on NPU).
+
+        Returns:
+            bias tensor of shape ``[B, vocab_size]``.
+        """
+        model = self.model
+        if hidden_states.dim() == 1:
+            hidden_states = hidden_states.unsqueeze(0)
+        gru_last = gru_state[-1, :, :].to(hidden_states.dtype)
+        concat = torch.cat([hidden_states, gru_last], dim=-1)
+        return model.embed_proj(concat)
+
     def compute_domino_logits(
         self,
         hidden_states: torch.Tensor,
         gru_state: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Apply the Domino causal correction head to compute corrected logits.
+        """Apply the Domino causal correction head.
 
-        Args:
-            hidden_states: Draft hidden state for the current query token,
-                shape ``[hidden_size]`` or ``[1, hidden_size]``.
-            gru_state: GRU hidden state that already encodes all previously
-                sampled tokens, shape ``[num_layers, batch, gru_hidden_dim]``.
+        Equivalent to ``compute_logits(hidden) + compute_domino_bias(hidden,
+        gru_state)`` but kept for backward compatibility.
 
-        Returns:
-            A tuple of ``(logits, gru_state)``. ``logits`` has shape
-            ``[1, vocab_size]`` and ``gru_state`` is unchanged.
+        Returns ``(logits, gru_state)`` where logits has shape ``[B, vocab]``.
         """
-        model = self.model
-        assert model.projector_type == "domino"
-
-        if hidden_states.dim() == 1:
-            hidden_states = hidden_states.unsqueeze(0)
-
-        # gru_state is held in fp16 (see update_domino_gru_state); cast back to
-        # the activation dtype for the residual correction so embed_proj runs
-        # in the model's native dtype.
-        gru_last = gru_state[-1, :, :].to(hidden_states.dtype)
-        # Compute a residual logit correction and add it to the base logits.
-        concat = torch.cat([hidden_states, gru_last], dim=-1)
-        bias = model.embed_proj(concat)
+        bias = self.compute_domino_bias(hidden_states, gru_state)
         base_logits = self.compute_logits(hidden_states)
-
-        # One-shot debug: verify embed_proj weights are loaded and compare
-        # base_logits scale vs bias scale.
-        if not getattr(self, "_domino_logits_dbg", False):
-            self._domino_logits_dbg = True
-            ep0 = model.embed_proj[0].weight
-            ep2 = model.embed_proj[2].weight
-            logger.info(
-                "[Domino dbg] embed_proj[0] shape=%s norm=%.4f dtype=%s",
-                tuple(ep0.shape), ep0.norm().item(), ep0.dtype,
-            )
-            logger.info(
-                "[Domino dbg] embed_proj[2] shape=%s norm=%.4f dtype=%s",
-                tuple(ep2.shape), ep2.norm().item(), ep2.dtype,
-            )
-            logger.info(
-                "[Domino dbg] base_logits shape=%s norm=%.4f abs_mean=%.4f",
-                tuple(base_logits.shape), base_logits.norm().item(),
-                base_logits.abs().mean().item(),
-            )
-            logger.info(
-                "[Domino dbg] bias shape=%s norm=%.4f abs_mean=%.4f",
-                tuple(bias.shape), bias.norm().item(),
-                bias.abs().mean().item(),
-            )
-            logger.info(
-                "[Domino dbg] concat shape=%s norm=%.4f",
-                tuple(concat.shape), concat.norm().item(),
-            )
-
         return base_logits + bias, gru_state
 
     def update_domino_gru_state(
@@ -684,40 +662,6 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         if token_ids.dim() == 0:
             token_ids = token_ids.unsqueeze(0)
         embeds = model.embed_input_ids(token_ids).unsqueeze(1)
-        # One-shot debug log to verify (a) _maybe_share_embeddings actually
-        # swapped draft.embed_tokens to the target model's embedding,
-        # (b) prefix_gru weights are non-zero (loaded), and (c) the GRU input
-        # statistics look reasonable. Controlled by attribute on the model so
-        # we only print on first call across all requests.
-        if not getattr(model, "_domino_dbg_logged", False):
-            model._domino_dbg_logged = True
-            try:
-                emb = model.embed_tokens
-                w_ih = model.prefix_gru.weight_ih_l0
-                w_hh = model.prefix_gru.weight_hh_l0
-                logger.info(
-                    "[Domino dbg] embed_tokens id=%s shape=%s dtype=%s "
-                    "weight_norm=%.4f",
-                    id(emb),
-                    tuple(emb.weight.shape),
-                    emb.weight.dtype,
-                    emb.weight.float().norm().item(),
-                )
-                logger.info(
-                    "[Domino dbg] prefix_gru weight_ih norm=%.4f weight_hh norm=%.4f "
-                    "ih_dtype=%s",
-                    w_ih.float().norm().item(),
-                    w_hh.float().norm().item(),
-                    w_ih.dtype,
-                )
-                logger.info(
-                    "[Domino dbg] token_ids=%s embeds_norm=%.4f embeds_dtype=%s",
-                    token_ids.tolist()[:8],
-                    embeds.float().norm().item(),
-                    embeds.dtype,
-                )
-            except Exception as exc:  # pragma: no cover
-                logger.warning("[Domino dbg] failed: %s", exc)
         # NPU's GRU op only accepts fp16; ensure both inputs match the GRU
         # weight dtype (set to fp16 in the model's __init__).
         gru_dtype = model.prefix_gru.weight_ih_l0.dtype

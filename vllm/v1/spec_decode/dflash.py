@@ -407,30 +407,25 @@ class DominoDFlashProposer(DFlashProposer):
 
         prefix_len = self.pure_draft_prefix_len
 
-        for req_idx in range(batch_size):
-            # Seed the GRU state with the request's bonus token.
-            gru_state = self.model.update_domino_gru_state(
-                bonus_token_ids[req_idx].unsqueeze(0), None
-            )
+        # Pre-compute base_logits for all steps in one batched GEMM.
+        base_logits_all = self.model.compute_logits(
+            hidden_states
+        ).view(batch_size, num_spec, -1)  # [B, nspec, vocab]
 
-            for step in range(num_spec):
-                hidden = hidden_3d[req_idx, step, :]
-                # The first ``pure_draft_prefix_len`` spec steps use bare
-                # backbone logits; the rest use the Domino correction head.
-                # This mirrors SpecForge's suffix_start which yields exactly
-                # pure_prefix pure-backbone steps in both shift_label modes
-                # (the hidden-state offset for shift_label=True is handled in
-                # set_inputs_first_pass).
-                if step < prefix_len:
-                    logits = self.model.compute_logits(hidden.unsqueeze(0))
-                else:
-                    logits, gru_state = self.model.compute_domino_logits(
-                        hidden, gru_state
-                    )
-                token = logits.argmax(dim=-1).view(())
-                out[req_idx * num_spec + step] = token
-                gru_state = self.model.update_domino_gru_state(
-                    token.unsqueeze(0), gru_state
-                )
+        # Seed all requests' GRU states in one batched call.
+        gru_state = self.model.update_domino_gru_state(
+            bonus_token_ids, None
+        )
+
+        for step in range(num_spec):
+            hidden = hidden_3d[:, step, :]  # [B, H]
+            if step < prefix_len:
+                logits = base_logits_all[:, step, :]
+            else:
+                bias = self.model.compute_domino_bias(hidden, gru_state)
+                logits = base_logits_all[:, step, :] + bias
+            tokens = logits.argmax(dim=-1)  # [B]
+            out[step::num_spec] = tokens
+            gru_state = self.model.update_domino_gru_state(tokens, gru_state)
 
         return out
