@@ -338,6 +338,43 @@ class DominoDFlashProposer(DFlashProposer):
         self.shift_label: bool = bool(dflash_config.get("shift_label", False))
 
     @override
+    def set_inputs_first_pass(
+        self,
+        target_token_ids: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        target_positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        token_indices_to_sample: torch.Tensor | None,
+        cad: CommonAttentionMetadata,
+        num_rejected_tokens_gpu: torch.Tensor | None,
+    ) -> tuple[int, torch.Tensor, CommonAttentionMetadata]:
+        """Adjust token_indices_to_sample for shift_label=True.
+
+        DFlash's triton kernel writes indices [1, 2, ..., num_spec] per request
+        (skipping the bonus at position 0).  This is correct for
+        shift_label=False where hidden[p] predicts the token at position p
+        (fill-in-the-blank).  For shift_label=True, hidden[p] predicts the
+        token at position p+1 (next-token), so the first spec token comes from
+        hidden[0] (the bonus position).  Shift all indices by -1 to gather
+        positions [0, 1, ..., num_spec-1] instead.
+        """
+        result = super().set_inputs_first_pass(
+            target_token_ids,
+            next_token_ids,
+            target_positions,
+            target_hidden_states,
+            token_indices_to_sample,
+            cad,
+            num_rejected_tokens_gpu,
+        )
+        num_query_total, tits, new_cad = result
+
+        if self.shift_label:
+            tits = tits - 1
+
+        return num_query_total, tits, new_cad
+
+    @override
     def _greedy_sample(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Sample draft tokens with the Domino causal correction head.
 
@@ -369,7 +406,6 @@ class DominoDFlashProposer(DFlashProposer):
         )
 
         prefix_len = self.pure_draft_prefix_len
-        shift_label = self.shift_label
 
         for req_idx in range(batch_size):
             # Seed the GRU state with the request's bonus token.
@@ -379,17 +415,18 @@ class DominoDFlashProposer(DFlashProposer):
 
             for step in range(num_spec):
                 hidden = hidden_3d[req_idx, step, :]
-                # SpecForge: shift_label=True applies Domino to every
-                # speculative position (suffix_start == pure_prefix). When
-                # shift_label=False the first pure_prefix positions skip the
-                # head and use bare backbone logits.
-                use_domino = shift_label or step >= prefix_len
-                if use_domino:
+                # The first ``pure_draft_prefix_len`` spec steps use bare
+                # backbone logits; the rest use the Domino correction head.
+                # This mirrors SpecForge's suffix_start which yields exactly
+                # pure_prefix pure-backbone steps in both shift_label modes
+                # (the hidden-state offset for shift_label=True is handled in
+                # set_inputs_first_pass).
+                if step < prefix_len:
+                    logits = self.model.compute_logits(hidden.unsqueeze(0))
+                else:
                     logits, gru_state = self.model.compute_domino_logits(
                         hidden, gru_state
                     )
-                else:
-                    logits = self.model.compute_logits(hidden.unsqueeze(0))
                 token = logits.argmax(dim=-1).view(())
                 out[req_idx * num_spec + step] = token
                 gru_state = self.model.update_domino_gru_state(
