@@ -631,6 +631,36 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         concat = torch.cat([hidden_states, gru_last], dim=-1)
         bias = model.embed_proj(concat)
         base_logits = self.compute_logits(hidden_states)
+
+        # One-shot debug: verify embed_proj weights are loaded and compare
+        # base_logits scale vs bias scale.
+        if not getattr(self, "_domino_logits_dbg", False):
+            self._domino_logits_dbg = True
+            ep0 = model.embed_proj[0].weight
+            ep2 = model.embed_proj[2].weight
+            logger.info(
+                "[Domino dbg] embed_proj[0] shape=%s norm=%.4f dtype=%s",
+                tuple(ep0.shape), ep0.norm().item(), ep0.dtype,
+            )
+            logger.info(
+                "[Domino dbg] embed_proj[2] shape=%s norm=%.4f dtype=%s",
+                tuple(ep2.shape), ep2.norm().item(), ep2.dtype,
+            )
+            logger.info(
+                "[Domino dbg] base_logits shape=%s norm=%.4f abs_mean=%.4f",
+                tuple(base_logits.shape), base_logits.norm().item(),
+                base_logits.abs().mean().item(),
+            )
+            logger.info(
+                "[Domino dbg] bias shape=%s norm=%.4f abs_mean=%.4f",
+                tuple(bias.shape), bias.norm().item(),
+                bias.abs().mean().item(),
+            )
+            logger.info(
+                "[Domino dbg] concat shape=%s norm=%.4f",
+                tuple(concat.shape), concat.norm().item(),
+            )
+
         return base_logits + bias, gru_state
 
     def update_domino_gru_state(
