@@ -407,23 +407,21 @@ class DominoDFlashProposer(DFlashProposer):
 
         prefix_len = self.pure_draft_prefix_len
 
-        # Pre-compute base_logits for all steps in one batched GEMM.
-        base_logits_all = self.model.compute_logits(
-            hidden_states
-        ).view(batch_size, num_spec, -1)  # [B, nspec, vocab]
-
         # Seed all requests' GRU states in one batched call.
         gru_state = self.model.update_domino_gru_state(
             bonus_token_ids, None
         )
 
+        # Compute base_logits per-step (batched across requests) to keep peak
+        # memory at [B, vocab] instead of [B*nspec, vocab].
         for step in range(num_spec):
             hidden = hidden_3d[:, step, :]  # [B, H]
+            base_logits = self.model.compute_logits(hidden)  # [B, vocab]
             if step < prefix_len:
-                logits = base_logits_all[:, step, :]
+                logits = base_logits
             else:
                 bias = self.model.compute_domino_bias(hidden, gru_state)
-                logits = base_logits_all[:, step, :] + bias
+                logits = base_logits + bias
             tokens = logits.argmax(dim=-1)  # [B]
             out[step::num_spec] = tokens
             gru_state = self.model.update_domino_gru_state(tokens, gru_state)
