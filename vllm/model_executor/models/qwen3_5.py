@@ -26,6 +26,7 @@
 
 from collections.abc import Iterable
 
+import os  # D8 instrumentation
 import torch
 from torch import nn
 
@@ -260,6 +261,177 @@ class Qwen3_5Model(Qwen3NextModel):
             self.norm = PPMissingLayer()
 
         self.aux_hidden_state_layers: tuple[int, ...] = ()
+
+        # D8 instrumentation v2 (temporary, env-guarded): per-layer output stats
+        # per forward step (jsonl, $D8_DUMP). First FA layer additionally dumps
+        # per-row NaN indices, input hidden stats, and the FA block table rows.
+        # Inactive when env unset.
+        _d8 = os.environ.get("D8_DUMP")
+        if _d8:
+            import json as _json
+
+            from vllm.forward_context import get_forward_context as _d8_gfc
+
+            _fh = open(_d8, "a", buffering=1)
+            _fa_layers = [
+                i for i, l in enumerate(self.layers)
+                if getattr(l, "self_attn", None) is not None
+            ]
+            _first_fa = _fa_layers[0] if _fa_layers else -1
+
+            def _d8_stats(t):
+                tf = t.float()
+                rec = {
+                    "absmax": float(tf.abs().max().item()),
+                    "mean": float(tf.mean().item()),
+                    "nan": int(torch.isnan(tf).sum().item()),
+                    "n": int(tf.numel()),
+                }
+                if tf.dim() >= 2 and rec["nan"] > 0:
+                    rows = torch.isnan(tf.reshape(tf.shape[0], -1)).any(dim=-1)
+                    rec["nan_rows"] = torch.nonzero(rows).flatten().tolist()[:8]
+                    rec["rows"] = int(tf.shape[0])
+                return rec
+
+            def _d8_extra(li):
+                # 首 FA 层：dump 本步所有组的 block table 与 seq_lens
+                try:
+                    ctx = _d8_gfc()
+                    am = ctx.attn_metadata
+                    out = {}
+                    if isinstance(am, dict):
+                        for _k, m in am.items():
+                            bt = getattr(m, "block_tables", None)
+                            if bt is None:
+                                bt = getattr(m, "block_table", None)
+                            if bt is not None:
+                                out[str(_k)[-60:]] = {
+                                    "bt": bt[:4, :10].cpu().tolist(),
+                                    "seq_lens": m.seq_lens[:4].cpu().tolist()
+                                    if hasattr(m, "seq_lens") else None,
+                                }
+                    return {"groups": out} if out else {}
+                except Exception as _e:  # noqa: BLE001
+                    return {"bt_err": repr(_e)}
+
+            def _d8_scan(args, kwargs):
+                """收集 args/kwargs 中所有 2D 浮点张量的统计（positions 等整型除外）。"""
+                out = {}
+                cand = list(enumerate(args)) + [(f"kw_{k}", v) for k, v in kwargs.items()]
+                for name, a in cand:
+                    t = a[0] if isinstance(a, tuple) else a
+                    if torch.is_tensor(t) and t.dtype in (torch.bfloat16, torch.float16, torch.float32) and t.dim() == 2:
+                        out[f"arg{name}"] = _d8_stats(t)
+                return out
+
+            _d8_deep = os.environ.get("D8_DEEP", "0") == "1"
+
+            def _d8_manual_attn(mod, q, k, v, out):
+                """对首个 FA 层做 naive 注意力重算，判定读侧/写侧。"""
+                rec = {}
+                try:
+                    ctx = _d8_gfc()
+                    am = ctx.attn_metadata
+                    m = am.get(mod.layer_name) if isinstance(am, dict) else am
+                    if m is None:
+                        for _k, _m in am.items():
+                            if getattr(_m, "block_tables", None) is not None:
+                                m = _m
+                                break
+                    kv = mod.kv_cache
+                    kc = kv[0] if isinstance(kv, (tuple, list)) else kv
+                    vc = kv[1] if isinstance(kv, (tuple, list)) else None
+                    if vc is None:
+                        return {"err": "no v cache"}
+                    bt, sl = m.block_tables, m.seq_lens
+                    R = bt.shape[0]
+                    n_tok = q.shape[0]
+                    kbs = kc.shape[1]  # kernel block size (128)
+                    Hkv, D = kc.shape[2], kc.shape[3]
+                    Hq = q.shape[-1] // D
+                    rows = {}
+                    for r in range(min(R, 4)):
+                        L = int(sl[r].item())
+                        if L <= 0 or L > 4608:
+                            continue
+                        nb = (L + kbs - 1) // kbs
+                        lbs = bt[r, :nb].long()
+                        K = kc[lbs].reshape(-1, Hkv, D)[:L].float()
+                        V = vc[lbs].reshape(-1, Hkv, D)[:L].float()
+                        rec_k = {"K_absmax": float(K.abs().max()), "K_nan": int(K.isnan().sum()),
+                                 "V_absmax": float(V.abs().max()), "V_nan": int(V.isnan().sum()),
+                                 "L": L, "lbs": lbs.tolist()[:8]}
+                        # naive attention（当前步该请求的 query 是 q 的第 r 行）
+                        try:
+                            if n_tok == R:
+                                qr = q[r].view(Hq, D).float()
+                                Kh = K.repeat_interleave(Hq // Hkv, dim=1)
+                                Vh = V.repeat_interleave(Hq // Hkv, dim=1)
+                                s = (qr @ Kh.T) * (1.0 / D**0.5)
+                                o = torch.softmax(s, dim=-1) @ Vh
+                                ok = out[r].view(Hq, -1)[:, :D].float() if out[r].numel() >= Hq * D else out[r].view(Hq, -1).float()
+                                o_flat = o.reshape(-1)
+                                ok_flat = ok.reshape(-1)[: o_flat.numel()]
+                                diff = (o_flat[: ok_flat.numel()] - ok_flat).abs().max()
+                                rec_k.update({
+                                    "manual_absmax": float(o_flat.abs().max()),
+                                    "manual_nan": int(o_flat.isnan().sum()),
+                                    "kernel_absmax": float(ok_flat.abs().max()),
+                                    "kernel_nan": int(ok_flat.isnan().sum()),
+                                    "max_abs_diff": float(diff),
+                                })
+                        except Exception as _e2:  # noqa: BLE001
+                            rec_k["manual_err"] = repr(_e2)[:150]
+                        rows[str(r)] = rec_k
+                    rec["rows"] = rows
+                except Exception as _e:  # noqa: BLE001
+                    rec["err"] = repr(_e)
+                return rec
+
+            for _li, _layer in enumerate(self.layers):
+
+                def _d8_make_hook(li):
+                    def _d8_hook(mod, args, kwargs, out):
+                        rec = {"layer": li}
+                        if li <= _first_fa:
+                            rec["in"] = _d8_scan(args, kwargs)
+                        if isinstance(out, tuple):
+                            for _oi, _t in enumerate(out):
+                                if torch.is_tensor(_t):
+                                    rec[f"out{_oi}"] = _d8_stats(_t)
+                            h = out[0]
+                        else:
+                            h = out
+                        if torch.is_tensor(h):
+                            rec.update(_d8_stats(h))
+                        if li == _first_fa:
+                            rec["meta"] = _d8_extra(li)
+                        _fh.write(_json.dumps(rec) + "\n")
+
+                    return _d8_hook
+
+                _layer.register_forward_hook(_d8_make_hook(_li), with_kwargs=True)
+
+            # 深度模式：hook 首 FA 层的 Attention 核心（q/k/v → attn out），
+            # 并做 naive 重算对照（读侧 vs 写侧判定）
+            if _d8_deep and _first_fa >= 0:
+                _attn_mod = self.layers[_first_fa].self_attn.attn
+
+                def _d8_attn_hook(mod, args, kwargs, out):
+                    rec = {"attn_core": True, "layer": _first_fa}
+                    q = kwargs.get("query", args[0] if len(args) > 0 else None)
+                    kk = kwargs.get("key", args[1] if len(args) > 1 else None)
+                    vv = kwargs.get("value", args[2] if len(args) > 2 else None)
+                    for nm, t in (("q", q), ("k", kk), ("v", vv)):
+                        if torch.is_tensor(t):
+                            rec[nm] = _d8_stats(t)
+                    if torch.is_tensor(out):
+                        rec["out"] = _d8_stats(out)
+                        if q is not None and kk is not None and vv is not None:
+                            rec["manual"] = _d8_manual_attn(mod, q, kk, vv, out)
+                    _fh.write(_json.dumps(rec) + "\n")
+
+                _attn_mod.register_forward_hook(_d8_attn_hook, with_kwargs=True)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # FSE must match construction (Qwen3NextSparseMoeBlock): reroute the
