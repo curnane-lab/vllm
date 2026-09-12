@@ -600,6 +600,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable batch-invariant mode: deterministic results regardless of
     # batch composition. Requires NVIDIA GPU with compute capability >= 9.0.
     "VLLM_BATCH_INVARIANT": lambda: bool(int(os.getenv("VLLM_BATCH_INVARIANT", "0"))),
+    # Decode-priority mode: when prefill throttling is active
+    # (--prefill-schedule-interval > 1), prefills keep yielding to decode
+    # even while the waiting queue is backlogged (ignores the DP-balancing
+    # prefill_capacity_bound latch).
+    "VLLM_DECODE_PRIORITY_PREFILL_YIELD": lambda: bool(
+        int(os.getenv("VLLM_DECODE_PRIORITY_PREFILL_YIELD", "0"))
+    ),
     # Use tensor descriptors for Q/K/V loads and output stores in the
     # Triton unified-attention kernel.  Enables HW 2D block reads on
     # Intel XPU; the non-TD branch is dead-code-eliminated at Triton

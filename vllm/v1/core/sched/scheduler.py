@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -461,9 +462,15 @@ class Scheduler(SchedulerInterface):
         self.kv_cache_manager.new_step_starts()
 
         # DP prefill balancing: on a throttled (non-cadence-aligned) step, defer
-        # all prefill compute unless saturated.
+        # all prefill compute unless saturated. In decode-priority mode
+        # (VLLM_DECODE_PRIORITY_PREFILL_YIELD=1) the capacity latch is ignored
+        # so prefills keep yielding to decode even under waiting-queue backlog.
         defer_prefills = (
-            throttle_prefills and not self.prefill_capacity_bound
+            throttle_prefills
+            and (
+                envs.VLLM_DECODE_PRIORITY_PREFILL_YIELD
+                or not self.prefill_capacity_bound
+            )
         ) and any(not r.is_prefill_chunk for r in self.running)
 
         # First, schedule the RUNNING requests.

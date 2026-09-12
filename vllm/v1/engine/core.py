@@ -1107,6 +1107,20 @@ class EngineCoreProc(EngineCore):
                 assert addresses.coordinator_input is not None
                 logger.info("Waiting for READY message from DP Coordinator...")
 
+    def _should_throttle_prefills(self) -> bool:
+        """Honor --prefill-schedule-interval on the non-DP path.
+
+        On cadence-misaligned steps the scheduler defers prefill work while
+        any decode request is running (decode priority / phase isolation).
+        The default interval of 1 never throttles.
+        """
+        interval = self.vllm_config.scheduler_config.prefill_schedule_interval
+        if interval <= 1:
+            return False
+        counter = getattr(self, "_prefill_cadence_counter", 0) + 1
+        self._prefill_cadence_counter = counter
+        return counter % interval != 0
+
     @contextmanager
     def _perform_handshakes(
         self,
