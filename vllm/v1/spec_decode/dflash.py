@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from dataclasses import replace
 from typing import Any
 
@@ -18,6 +19,10 @@ from vllm.v1.spec_decode.utils import (
 )
 
 logger = init_logger(__name__)
+
+# Debug probe (VLLM_DFLASH_MIRROR_PROBE=1): log per-window draft-mirror
+# context/query sizes to inspect prefix-hit cold-ingest behaviour. Debug only.
+_MIRROR_PROBE = os.environ.get("VLLM_DFLASH_MIRROR_PROBE", "") not in ("", "0")
 
 
 class DFlashProposer(SpecDecodeBaseProposer):
@@ -137,6 +142,17 @@ class DFlashProposer(SpecDecodeBaseProposer):
         grid = (batch_size, num_blocks)
 
         has_num_rejected = num_rejected_tokens_gpu is not None
+
+        if _MIRROR_PROBE:
+            logger.info(
+                "[dfmirror] set_inputs batch=%d num_context=%d "
+                "num_query_per_req=%d max_ctx_per_req=%d has_num_rejected=%s",
+                batch_size,
+                num_context,
+                num_query_per_req,
+                max_ctx_per_req,
+                has_num_rejected,
+            )
         copy_and_expand_dflash_inputs_kernel[grid](
             # Inputs
             next_token_ids_ptr=next_token_ids,
@@ -271,6 +287,11 @@ class DFlashProposer(SpecDecodeBaseProposer):
         # Context and query positions/slots were written to separate
         # buffers by the kernel — no copy needed.
         num_context = self._dflash_num_context
+        if _MIRROR_PROBE:
+            logger.info(
+                "[dfmirror] ctx_insert num_context=%d",
+                num_context,
+            )
 
         # Pre-insert context KVs directly into cache
         self.model.precompute_and_store_context_kv(
