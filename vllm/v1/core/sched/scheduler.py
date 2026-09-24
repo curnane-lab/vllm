@@ -359,7 +359,7 @@ class Scheduler(SchedulerInterface):
         # this pass's forward runs; the cache entries are published at the
         # start of the pass (async scheduling runs update_from_output of the
         # previous step only after this schedule pass).
-        self._mamba_checkpoint_dispatched: set[str] = set()
+        self._mamba_checkpoint_dispatched: dict[str, int] = {}
 
     def _mamba_block_aligned_split(
         self,
@@ -1322,7 +1322,9 @@ class Scheduler(SchedulerInterface):
                 and request.num_computed_tokens + num_scheduled
                 == request.mamba_checkpoint_position
             ):
-                self._mamba_checkpoint_dispatched.add(req_id)
+                self._mamba_checkpoint_dispatched[req_id] = (
+                    request.mamba_checkpoint_position
+                )
 
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
