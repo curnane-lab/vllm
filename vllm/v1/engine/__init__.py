@@ -136,6 +136,11 @@ class EngineCoreRequest(
     # KV-transfer request is rejected on the D node before engine admission.
     abort_immediately: bool = False
 
+    # Application-directed Mamba prefix checkpoint: token position (in the
+    # marker-stripped prompt) whose recurrent state should be checkpointed
+    # into the prefix cache. None when the prompt carries no marker.
+    mamba_checkpoint_position: int | None = None
+
     @property
     def params(self) -> SamplingParams | PoolingParams:
         """Return the processed params (sampling or pooling)."""

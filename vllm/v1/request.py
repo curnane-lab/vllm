@@ -77,6 +77,7 @@ class Request:
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         abort_immediately: bool = False,
+        mamba_checkpoint_position: int | None = None,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -214,6 +215,16 @@ class Request:
         # the scheduler so the connector's request_finished hook runs.
         self.abort_immediately = abort_immediately
 
+        # Application-directed Mamba prefix checkpoint (see
+        # EngineCoreRequest.mamba_checkpoint_position). Set once at admission.
+        self.mamba_checkpoint_position = mamba_checkpoint_position
+        # Set while the request's checkpoint hash is registered but its state
+        # snapshot has not been committed by a forward yet.
+        self.waiting_for_mamba_checkpoint = False
+        # Same-step pairing state (reset every scheduling pass).
+        self.mamba_checkpoint_source_block_ids: tuple[int, ...] | None = None
+        self.mamba_prefix_producer_id: str | None = None
+
     @classmethod
     def from_engine_core_request(
         cls,
@@ -239,6 +250,7 @@ class Request:
             reasoning_ended=request.reasoning_ended,
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
             abort_immediately=request.abort_immediately,
+            mamba_checkpoint_position=request.mamba_checkpoint_position,
         )
 
     def append_output_token_ids(

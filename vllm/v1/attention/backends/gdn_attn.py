@@ -71,6 +71,19 @@ class GDNAttentionMetadata:
     # Chunk-kernel inputs for prefill
     prefill_query_start_loc: torch.Tensor | None = None
     prefill_state_indices: torch.Tensor | None = None
+
+    # Explicit grouped-prefill two-phase execution (same-step checkpoint
+    # pairing). Ranges are [start, end) token positions in the packed prefill
+    # stream; state values are cache-row IDs.
+    prefix_producer_ranges: torch.Tensor | None = None
+    producer_token_indices: torch.Tensor | None = None
+    producer_query_start_loc: torch.Tensor | None = None
+    consumer_ranges: torch.Tensor | None = None
+    consumer_token_indices: torch.Tensor | None = None
+    consumer_query_start_loc: torch.Tensor | None = None
+    shared_state_destinations: torch.Tensor | None = None
+    consumer_shared_state_sources: torch.Tensor | None = None
+    private_final_state_destination: torch.Tensor | None = None
     prefill_has_initial_state: torch.Tensor | None = None
 
     # The following attributes are for triton implementation of causal_conv1d

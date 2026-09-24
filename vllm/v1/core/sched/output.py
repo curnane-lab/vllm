@@ -45,6 +45,9 @@ class NewRequestData:
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
 
+    mamba_checkpoint_source_block_ids: tuple[int, ...] | None = None
+    mamba_prefix_producer_id: str | None = None
+
     @classmethod
     def from_request(
         cls,
@@ -60,6 +63,12 @@ class NewRequestData:
             pooling_params=request.pooling_params,
             block_ids=block_ids,
             num_computed_tokens=request.num_computed_tokens,
+            mamba_checkpoint_source_block_ids=getattr(
+                request, "mamba_checkpoint_source_block_ids", None
+            ),
+            mamba_prefix_producer_id=getattr(
+                request, "mamba_prefix_producer_id", None
+            ),
             lora_request=request.lora_request,
             prompt_embeds=request.prompt_embeds,
             prompt_is_token_ids=request.prompt_is_token_ids,
@@ -257,6 +266,8 @@ class SchedulerOutput:
 
     # Dynamic speculative decoding: optimal K chosen by scheduler.
     # Number of spec tokens to schedule for the next step.
+    mamba_prefix_producer_ids: dict[str, str] | None = None
+
     num_spec_tokens_to_schedule: int = 0
 
     @classmethod

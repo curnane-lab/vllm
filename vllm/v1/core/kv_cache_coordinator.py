@@ -13,6 +13,7 @@ from vllm.v1.core.kv_cache_utils import (
     KVCacheBlock,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
+    MambaManager,
     CrossAttentionManager,
     SingleTypeKVCacheManager,
     get_manager_for_kv_cache_spec,
@@ -362,6 +363,33 @@ class KVCacheCoordinator(ABC):
         """
         return tuple(
             manager.req_to_blocks.get(request_id) or []
+            for manager in self.single_type_managers
+        )
+
+    def mark_checkpoint_ready(self, request_id: str) -> None:
+        """Make a checkpoint cache entry visible after its forward completes."""
+        for manager in self.single_type_managers:
+            manager.mark_checkpoint_ready(request_id)
+
+    def prepare_same_step_mamba_consumer(
+        self,
+        request_id: str,
+        mamba_source_blocks: Sequence[KVCacheBlock],
+        checkpoint_position: int,
+    ) -> None:
+        mamba_managers = [
+            manager
+            for manager in self.single_type_managers
+            if isinstance(manager, MambaManager)
+        ]
+        for manager, block in zip(mamba_managers, mamba_source_blocks, strict=True):
+            manager.prepare_same_step_mamba_consumer(
+                request_id, [block], checkpoint_position
+            )
+
+    def has_unready_checkpoint(self, request: Request) -> bool:
+        return any(
+            manager.has_unready_checkpoint(request)
             for manager in self.single_type_managers
         )
 

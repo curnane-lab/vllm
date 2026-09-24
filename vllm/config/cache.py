@@ -3,7 +3,7 @@
 
 from collections.abc import Callable
 from dataclasses import field
-from typing import Any, ClassVar, Literal
+from typing import Any, ClassVar, Final, Literal
 
 from pydantic import Field, field_validator, model_validator
 
@@ -36,6 +36,8 @@ CacheDType = Literal[
 ]
 MambaDType = Literal["auto", "float32", "float16", "bfloat16"]
 MambaCacheMode = Literal["all", "align", "none"]
+
+DEFAULT_MAMBA_CHECKPOINT_TOKEN: Final[str] = "<|mamba_checkpoint|>"
 PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor", "xxhash", "xxhash_cbor"]
 KVOffloadingBackend = Literal["native", "lmcache"]
 
@@ -145,6 +147,17 @@ class CacheConfig:
     - "align": only cache the mamba state of the last token of each scheduler step and
            when the token is at position i * block_size.
     """
+    enable_mamba_checkpoint: bool = False
+    """Whether to enable explicit prompt Mamba checkpoint marker parsing."""
+    mamba_checkpoint_token: str | None = Field(
+        default=DEFAULT_MAMBA_CHECKPOINT_TOKEN, min_length=1
+    )
+    """Tokenizer token marking a Mamba prefix-cache checkpoint.
+
+    The token is registered by the Hugging Face renderer, resolved to one token ID,
+    and removed before the model request is created, so it does not affect model
+    inputs or prefix hashes.
+    """
 
     # Will be set after profiling.
     num_gpu_blocks: int | None = field(default=None, init=False)
@@ -210,6 +223,8 @@ class CacheConfig:
             "prefix_caching_hash_algo",
             # Prefix-caching implementation detail (doesn't affect compiled graph).
             "prefix_match_unit",
+            "enable_mamba_checkpoint",
+            "mamba_checkpoint_token",
             "mamba_page_size_padded",
             "skip_page_size_padded",
             "user_specified_block_size",
@@ -257,6 +272,12 @@ class CacheConfig:
             self.user_specified_block_size = True
         if self.mamba_block_size is not None:
             self.user_specified_mamba_block_size = True
+        if (
+            self.enable_prefix_caching
+            and self.enable_mamba_checkpoint
+            and self.mamba_cache_mode == "none"
+        ):
+            self.mamba_cache_mode = "align"
         return self
 
     @field_validator("calculate_kv_scales", mode="after")

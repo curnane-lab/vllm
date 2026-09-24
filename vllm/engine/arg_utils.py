@@ -697,6 +697,8 @@ class EngineArgs:
     mamba_block_size: int | None = get_field(CacheConfig, "mamba_block_size")
     prefix_match_unit: int | None = get_field(CacheConfig, "prefix_match_unit")
     mamba_cache_mode: MambaCacheMode = CacheConfig.mamba_cache_mode
+    enable_mamba_checkpoint: bool = CacheConfig.enable_mamba_checkpoint
+    mamba_checkpoint_token: str | None = CacheConfig.mamba_checkpoint_token
 
     mamba_backend: MambaBackendEnum = MambaBackendEnum.TRITON
     enable_mamba_cache_stochastic_rounding: bool = (
@@ -1202,6 +1204,12 @@ class EngineArgs:
         )
         cache_group.add_argument(
             "--mamba-cache-mode", **cache_kwargs["mamba_cache_mode"]
+        )
+        cache_group.add_argument(
+            "--enable-mamba-checkpoint", **cache_kwargs["enable_mamba_checkpoint"]
+        )
+        cache_group.add_argument(
+            "--mamba-checkpoint-token", **cache_kwargs["mamba_checkpoint_token"]
         )
         cache_group.add_argument(
             "--kv-offloading-size", **cache_kwargs["kv_offloading_size"]
@@ -1919,6 +1927,8 @@ class EngineArgs:
             mamba_block_size=self.mamba_block_size,
             prefix_match_unit=self.prefix_match_unit,
             mamba_cache_mode=self.mamba_cache_mode,
+            enable_mamba_checkpoint=self.enable_mamba_checkpoint,
+            mamba_checkpoint_token=self.mamba_checkpoint_token,
             kv_offloading_size=self.kv_offloading_size,
             kv_offloading_backend=self.kv_offloading_backend,
         )
