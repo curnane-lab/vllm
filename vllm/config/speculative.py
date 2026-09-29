@@ -66,7 +66,13 @@ MTPModelTypes = Literal[
     "glm5_next_mtp",
 ]
 NgramGPUTypes = Literal["ngram_gpu"]
-DFlashModelTypes = Literal["dflash"]
+DFlashModelTypes = Literal[
+    "dflash",
+    "mamba_attn_hybrid",
+]
+_DFLASH_ARCH_TO_METHOD: dict[str, str] = {
+    "MambaAttnHybridDraftModel": "mamba_attn_hybrid",
+}
 DSparkModelTypes = Literal["dspark"]
 EagleModelTypes = Literal[
     "eagle", "eagle3", "extract_hidden_states", MTPModelTypes, DFlashModelTypes
@@ -461,6 +467,14 @@ class SpeculativeConfig:
     O(2 * tp_size) per token. Only applies to greedy draft selection in
     non-tree speculation."""
 
+    enable_kv_sharing: bool = False
+    """Share KV cache between draft and target models. Each draft attention
+    sub-layer reads from its mapped verifier layer's KV cache instead of
+    maintaining its own, so the draft allocates no KV storage of its own.
+    For mamba_attn_hybrid the mapping follows attn_kv_layer_ids
+    (non-sequential). Requires draft and target to have the same number of
+    KV heads and head size."""
+
     use_heterogeneous_vocab: bool = False
     """Allow draft and target models to use different vocabularies.
     When enabled, builds a token-level intersection at init and constrains
@@ -629,6 +643,7 @@ class SpeculativeConfig:
             "extract_hidden_states",
             "dflash",
             "dspark",
+            "mamba_attn_hybrid",
         )
         factors.append(uses_aux_hidden_states)
         if self.method == "dspark":
@@ -1318,7 +1333,13 @@ class SpeculativeConfig:
                         draft_hf.truncated_vocab_size = target_vocab
 
                 # Automatically detect the method
-                if self.method in ("eagle", "eagle3", "dflash", "dspark"):
+                if self.method in (
+                    "eagle",
+                    "eagle3",
+                    "dflash",
+                    "dspark",
+                    "mamba_attn_hybrid",
+                ):
                     pass
                 # examples:
                 # yuhuili/EAGLE-LLaMA3-Instruct-8B
@@ -1329,6 +1350,13 @@ class SpeculativeConfig:
                     self.method = "eagle"
                 elif "eagle3" in self.draft_model_config.model.lower():
                     self.method = "eagle3"
+                elif (
+                    self.draft_model_config.hf_config.architectures[0]
+                    in _DFLASH_ARCH_TO_METHOD
+                ):
+                    self.method = _DFLASH_ARCH_TO_METHOD[
+                        self.draft_model_config.hf_config.architectures[0]
+                    ]
                 elif (
                     "dflash" in self.draft_model_config.model.lower()
                     or "MuseGlimmerAssistantModel"
@@ -1459,7 +1487,9 @@ class SpeculativeConfig:
                     ):
                         hf.dspark_target_layer_ids = hf.target_layer_ids
 
-                if self.method in ("dflash", "dspark"):
+                if self.method in ("dflash", "dspark") or self.method in get_args(
+                    DFlashModelTypes
+                ):
                     self.parallel_drafting = True
 
                 if self.num_speculative_tokens is not None and hasattr(
@@ -1939,7 +1969,9 @@ class SpeculativeConfig:
         # NOTE: This method is usually a stand-in for "speculative decoding using
         # target model hidden states"
         # TODO(ben): Refactor this so the naming is clearer
-        return self.method in ("eagle", "eagle3", "mtp", "dflash", "dspark")
+        return self.method in ("eagle", "eagle3", "mtp", "dflash", "dspark") or (
+            self.method in get_args(DFlashModelTypes)
+        )
 
     def use_eagle_block_drop(self) -> bool:
         """Whether volatile trailing cache blocks should be discarded."""
@@ -1950,6 +1982,12 @@ class SpeculativeConfig:
 
     def use_dspark(self) -> bool:
         return self.method == "dspark"
+
+    def use_mamba_attn_hybrid(self) -> bool:
+        return self.method == "mamba_attn_hybrid"
+
+    def uses_infill_bonus_token(self) -> bool:
+        return self.method in get_args(DFlashModelTypes)
 
     def uses_dynamic_speculative_decoding(self) -> bool:
         return self.num_speculative_tokens_per_batch_size is not None

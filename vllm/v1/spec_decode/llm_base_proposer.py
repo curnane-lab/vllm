@@ -35,6 +35,9 @@ from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.model_executor.models.laguna_dflash import DFlashLagunaForCausalLM
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 from vllm.model_executor.models.qwen3_dflash import DFlashQwen3ForCausalLM
+from vllm.model_executor.models.qwen3_dflash_mamba_attn_hybrid import (
+    MambaAttnHybridQwen3ForCausalLM,
+)
 from vllm.model_executor.models.qwen3_eagle3 import Eagle3Qwen3ForCausalLM
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import PIN_MEMORY, async_tensor_h2d
@@ -115,7 +118,12 @@ class SpecDecodeBaseProposer:
             1 if not self.parallel_drafting else self.num_speculative_tokens
         )
         self.net_num_new_slots_per_request = self.extra_slots_per_request - (
-            1 if (self.pass_hidden_states_to_model and self.method != "dflash") else 0
+            1
+            if (
+                self.pass_hidden_states_to_model
+                and not self.speculative_config.uses_infill_bonus_token()
+            )
+            else 0
         )
         self.needs_extra_input_slots = self.net_num_new_slots_per_request > 0
 
@@ -509,6 +517,21 @@ class SpecDecodeBaseProposer:
     def take_last_draft_probs(self) -> torch.Tensor | None:
         return self._last_draft_probs
 
+    def _parallel_sample_draft(
+        self,
+        sample_hidden_states: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> torch.Tensor:
+        draft_token_ids, draft_probs = self._sample_draft_tokens(
+            sample_hidden_states, sampling_metadata
+        )
+        if draft_probs is not None:
+            self._last_draft_probs = draft_probs.view(
+                -1, self.num_speculative_tokens, draft_probs.shape[-1]
+            ).contiguous()
+        return draft_token_ids.view(-1, self.num_speculative_tokens)
+
     def propose(
         self,
         num_speculative_tokens,
@@ -533,7 +556,11 @@ class SpecDecodeBaseProposer:
         self._last_draft_probs = None
         batch_size = common_attn_metadata.batch_size()
 
-        if self.method in ("eagle3", "dflash"):
+        if self.method in (
+            "eagle3",
+            "dflash",
+            "mamba_attn_hybrid",
+        ):
             model = self.model
             if isinstance(model, BreakableCUDAGraphWrapper):
                 model = model.unwrap()
@@ -545,12 +572,16 @@ class SpecDecodeBaseProposer:
                     DFlashQwen3ForCausalLM,
                     Eagle3Qwen3ForCausalLM,
                     DFlashLagunaForCausalLM,
+                    MambaAttnHybridQwen3ForCausalLM,
                 ),
             )
             target_hidden_states = self.model.combine_hidden_states(
                 target_hidden_states
             )
-            assert target_hidden_states.shape[-1] == self.hidden_size
+            assert (
+                target_hidden_states.shape[-1] == self.hidden_size
+                or self.method == "mamba_attn_hybrid"
+            )
 
         num_tokens, token_indices_to_sample, common_attn_metadata = (
             self.set_inputs_first_pass(
@@ -627,14 +658,9 @@ class SpecDecodeBaseProposer:
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
-            draft_token_ids, draft_probs = self._sample_draft_tokens(
-                sample_hidden_states, sampling_metadata
+            return self._parallel_sample_draft(
+                sample_hidden_states, next_token_ids, sampling_metadata
             )
-            if draft_probs is not None:
-                self._last_draft_probs = draft_probs.view(
-                    -1, self.num_speculative_tokens, draft_probs.shape[-1]
-                ).contiguous()
-            return draft_token_ids.view(-1, self.num_speculative_tokens)
 
         if self.uses_mrope:
             positions = self.mrope_positions[:, token_indices_to_sample]
@@ -1012,7 +1038,12 @@ class SpecDecodeBaseProposer:
                     "KimiK3MTPModel",
                 }.intersection(architectures)
             )
-        return self.method not in ("mtp", "draft_model", "dflash")
+        return self.method not in (
+            "mtp",
+            "draft_model",
+            "dflash",
+            "mamba_attn_hybrid",
+        )
 
     def prepare_next_token_ids_cpu(
         self,
@@ -1397,6 +1428,7 @@ class SpecDecodeBaseProposer:
 
         self._maybe_share_embeddings(target_language_model)
         self._maybe_share_lm_head(target_language_model)
+        self._maybe_share_kv_cache(target_language_model)
 
         if (
             self.parallel_drafting
@@ -1504,6 +1536,45 @@ class SpecDecodeBaseProposer:
                 "The draft model's vocab embedding will be loaded separately"
                 " from the target model."
             )
+
+    def _maybe_share_kv_cache(self, target_language_model: nn.Module) -> None:
+        if (
+            self.method != "mamba_attn_hybrid"
+            or not self.speculative_config.enable_kv_sharing
+        ):
+            return
+
+        draft_inner = getattr(self.model, "model", None)
+        if draft_inner is None or not hasattr(draft_inner, "layers"):
+            logger.warning(
+                "enable_kv_sharing is set but could not access "
+                "model.model.layers on draft. Skipping KV cache sharing."
+            )
+            return
+
+        target_num_layers = (
+            self.vllm_config.model_config.get_num_layers(
+                self.vllm_config.parallel_config
+            )
+        )
+
+        shared = 0
+        for draft_idx, layer in enumerate(draft_inner.layers):
+            if not hasattr(layer, "self_attn"):
+                continue
+            attn = getattr(layer.self_attn, "attn", None)
+            if attn is None:
+                continue
+            if draft_idx >= target_num_layers:
+                break
+            target_name = f"model.layers.{draft_idx}.self_attn.attn"
+            attn.kv_sharing_target_layer_name = target_name
+            shared += 1
+
+        logger.info(
+            "Shared KV cache for %d / %d draft layers with target model.",
+            shared, len(draft_inner.layers),
+        )
 
     def _maybe_share_lm_head(self, target_language_model: nn.Module) -> None:
         """Some draft models may not have their own LM head, and some may have a

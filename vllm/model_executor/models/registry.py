@@ -643,6 +643,10 @@ _SPECULATIVE_DECODING_MODELS = {
     # DFlashLagunaForCausalLM. The bare name is kept as a defensive alias.
     "MuseGlimmerAssistantModel": ("qwen3_dflash", "DFlashQwen3ForCausalLM"),
     "DFlashMuseGlimmerAssistantModel": ("qwen3_dflash", "DFlashQwen3ForCausalLM"),
+    "MambaAttnHybridDraftModel": (
+        "qwen3_dflash_mamba_attn_hybrid",
+        "MambaAttnHybridQwen3ForCausalLM",
+    ),
     "DSparkDraftModel": ("vllm.models.deepseek_v4", "DSparkDeepseekV4ForCausalLM"),
     "DSparkV41DraftModel": (
         "vllm.models.deepseek_v41",

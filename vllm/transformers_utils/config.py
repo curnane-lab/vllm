@@ -839,6 +839,11 @@ def maybe_override_with_speculators(
     speculative_config["method"] = speculators_method
     speculative_config["model"] = model
 
+    if vllm_speculative_config and speculative_config.get("method") == (
+        "mamba_attn_hybrid"
+    ):
+        speculative_config.update(vllm_speculative_config)
+
     # Override model and tokenizer with the verifier model from config
     verifier_model = speculators_config["verifier"]["name_or_path"]
     model = tokenizer = verifier_model

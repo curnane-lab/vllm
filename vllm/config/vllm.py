@@ -640,9 +640,9 @@ class VllmConfig:
         speculative_config = self.speculative_config
         if speculative_config is None:
             return 0
-        if speculative_config.use_dflash():
-            # DFlash requires an extra lookahead slot since it uses in-fill-style
-            # decoding instead of standard next-token sampling, so it has a query
+        if speculative_config.uses_infill_bonus_token():
+            # DFlash (and the mamba_attn_hybrid drafter, which shares the
+            # in-fill-style decoding) require an extra lookahead slot: a query
             # for the last sampled token plus queries for each draft token.
             return self.num_speculative_tokens + 1
         if speculative_config.use_eagle() or speculative_config.uses_draft_model():
@@ -3071,9 +3071,10 @@ class VllmConfig:
             # V2 EagleSpeculator does not support parallel_drafting (for P-Eagle).
             # DFlash and DSpark use parallel drafting natively in V2 via their
             # own speculators.
-            if (
-                speculative_config.parallel_drafting
-                and speculative_config.method not in ("dflash", "dspark")
+            if speculative_config.parallel_drafting and speculative_config.method not in (
+                "dflash",
+                "dspark",
+                "mamba_attn_hybrid",
             ):
                 unsupported.append("parallel drafting for EAGLE speculative decoding")
 

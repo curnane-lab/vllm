@@ -275,6 +275,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 "dflash",
                 "dspark",
                 "extract_hidden_states",
+                "mamba_attn_hybrid",
             ):
                 # Drafting may require auxiliary hidden states from target model outputs
                 self.use_aux_hidden_state_outputs = True

@@ -207,3 +207,76 @@ def update_dspark(config_dict: dict, pre_trained_config: dict) -> None:
     ):
         if config_dict.get(key) is not None:
             pre_trained_config[key] = config_dict[key]
+
+
+@register_speculator("mamba_attn_hybrid")
+def update_mamba_attn_hybrid(config_dict: dict, pre_trained_config: dict) -> None:
+    """
+    Apply Mamba-Attn-Hybrid config transformations.
+
+    Like DFlash-Mamba2Mix (standard Mamba-2 / SSD mixer + per-layer latent seed),
+    but the architecture is a FLEXIBLE recipe (``block_pattern``) and the attention
+    sub-layers map to verifier KV layers via ``attn_kv_layer_ids`` (the sole
+    verifier-KV source), DECOUPLED from the latent-fusion set. Two consequences for
+    the config translation:
+
+    - The verifier must capture hidden states for the FUSION layers (the latent
+      seed), so ``eagle_aux_hidden_state_layer_ids`` is set to
+      ``latent_fusion_layer_ids`` — NOT the KV set. (In DFlash-Mamba2Mix they
+      coincide, so it used ``aux_hidden_state_layer_ids``.)
+    - KV sharing is driven by ``attn_kv_layer_ids`` in the proposer; those reference
+      verifier layers directly (the verifier KV cache exists for every layer), so an
+      attn KV layer need not be in the fusion set.
+
+    The mamba-specific fields below are read at top level by
+    MambaAttnHybridQwen3Model.__init__; ``block_pattern`` / ``attn_kv_layer_ids`` are
+    read by both the model and the proposer.
+    """
+    pre_trained_config["architectures"] = ["MambaAttnHybridDraftModel"]
+    pre_trained_config["draft_vocab_size"] = config_dict.get("draft_vocab_size")
+    if config_dict.get("target_hidden_size") is not None:
+        pre_trained_config["target_hidden_size"] = config_dict["target_hidden_size"]
+
+    latent_fusion_layer_ids = config_dict.get("latent_fusion_layer_ids")
+    if latent_fusion_layer_ids is None:
+        latent_fusion_layer_ids = config_dict["aux_hidden_state_layer_ids"]
+    pre_trained_config["eagle_aux_hidden_state_layer_ids"] = latent_fusion_layer_ids
+    pre_trained_config["latent_fusion_layer_ids"] = latent_fusion_layer_ids
+
+    pre_trained_config["dflash_config"] = {
+        "mask_token_id": config_dict["mask_token_id"],
+        "target_layer_ids": [i - 1 for i in latent_fusion_layer_ids],
+    }
+
+    pre_trained_config["block_pattern"] = config_dict["block_pattern"]
+    pre_trained_config["attn_kv_layer_ids"] = config_dict["attn_kv_layer_ids"]
+
+    pre_trained_config["attn_rope"] = config_dict.get("attn_rope")
+
+    pre_trained_config["use_qk_norm"] = config_dict.get("use_qk_norm", True)
+
+    if config_dict.get("sliding_window_non_causal") is not None:
+        pre_trained_config["sliding_window_non_causal"] = config_dict[
+            "sliding_window_non_causal"
+        ]
+    if config_dict.get("sliding_window_prefix") is not None:
+        pre_trained_config["sliding_window_prefix"] = config_dict[
+            "sliding_window_prefix"
+        ]
+
+    pre_trained_config["mamba_d_state"] = config_dict.get("mamba_d_state", 16)
+    pre_trained_config["mamba_num_heads"] = config_dict.get("mamba_num_heads", 64)
+    pre_trained_config["mamba_head_dim"] = config_dict.get("mamba_head_dim", 64)
+    pre_trained_config["mamba_n_groups"] = config_dict.get("mamba_n_groups", 1)
+    pre_trained_config["mamba_conv_kernel"] = config_dict.get("mamba_conv_kernel", 4)
+    pre_trained_config["mamba_expand"] = config_dict.get("mamba_expand", 1)
+    pre_trained_config["mamba_seed_mode"] = config_dict.get(
+        "mamba_seed_mode", "per_layer"
+    )
+
+    for key in ("markov_rank", "markov_head_type"):
+        if config_dict.get(key) is not None:
+            pre_trained_config[key] = config_dict[key]
+
+    if config_dict.get("fc_norm") is not None:
+        pre_trained_config["fc_norm"] = config_dict["fc_norm"]
