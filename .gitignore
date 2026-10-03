@@ -21,6 +21,9 @@ vllm/third_party/fmha_sm100/
 # tml-fa4 vendored package built from source
 vllm/third_party/tml_fa4/
 
+# SketchSSM kernels vendored at build time
+vllm/third_party/sketchssm_kernels/
+
 # triton jit
 .triton
 

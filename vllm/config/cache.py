@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
 from collections.abc import Callable
 from dataclasses import field
 from functools import cache
@@ -202,7 +203,8 @@ class CacheConfig:
     replayssm_buffer_len: int = Field(default=16, gt=0)
     """ReplaySSM logical history length B for Mamba2. Triton uses B physical
     rows and FlashInfer uses B+T, where T is the target verification length.
-    Kimi-K3 speculative decode does not use B. Default 16."""
+    Kimi-K3 speculative decode does not use B. Also the SketchSSM window
+    length. Default 16."""
     use_replayssm: bool = False
     """Use the ReplaySSM Mamba2 decode kernel: cache recent SSM inputs and skip
     the per-step full-state store, writing the checkpoint back only on flush.
@@ -211,6 +213,12 @@ class CacheConfig:
     and mamba_cache_mode 'none'. In align mode flushes are most efficient when
     mamba_block_size is a multiple of replayssm_buffer_len, but this is not
     required."""
+    sketchssm: str | None = None
+    """SketchSSM calibration file, directory or Hugging Face repo id. Enables
+    SketchSSM decode, which reads a compact per-request sketch of the state."""
+    sketchssm_mean_rank: float | None = None
+    """Mean sketch rank per head for a portable `sketchssm` calibration
+    (default 8)."""
     use_kda_recoverssm: bool = field(default=False, init=False)
     """Whether Kimi-K3 KDA uses RecoverSSM speculative decode."""
 
@@ -312,6 +320,11 @@ class CacheConfig:
         # metrics info
         return {key: str(value) for key, value in self.__dict__.items()}
 
+    @property
+    def uses_mamba_window_rings(self) -> bool:
+        """Whether the Mamba cache holds ReplaySSM/SketchSSM window rings."""
+        return self.use_replayssm or self.sketchssm is not None
+
     _block_size_resolved: bool = field(default=False, init=False)
     """Guard against pydantic re-running _apply_block_size_default."""
 
@@ -333,6 +346,18 @@ class CacheConfig:
             self.block_size = self.DEFAULT_BLOCK_SIZE
         else:
             self.user_specified_block_size = True
+        return self
+
+    @model_validator(mode="after")
+    def _validate_sketchssm_mean_rank(self) -> "CacheConfig":
+        if self.sketchssm_mean_rank is None:
+            return self
+        if self.sketchssm is None:
+            raise ValueError("--sketchssm-mean-rank requires --sketchssm")
+        if not math.isfinite(self.sketchssm_mean_rank) or (
+            self.sketchssm_mean_rank < 1
+        ):
+            raise ValueError("--sketchssm-mean-rank must be finite and at least 1")
         return self
 
     @field_validator("cache_dtype", mode="after")

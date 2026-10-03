@@ -19,10 +19,16 @@ from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
 )
+from vllm.v1.attention.backends.mamba_attn import (
+    sketch_decode_rows,
+    sketch_prefill_build_rows,
+    sketch_prefill_rows,
+)
 from vllm.v1.attention.backends.utils import (
     NULL_BLOCK_ID,
     compute_causal_conv1d_metadata,
     mamba_get_block_table_tensor,
+    replayssm_decode_rows,
     split_decodes_and_prefills,
 )
 from vllm.v1.kv_cache_interface import MambaSpec
@@ -84,6 +90,17 @@ class GDNAttentionMetadata:
     nums_dict: dict | None = None
     batch_ptr: torch.Tensor | None = None
     token_chunk_offset_ptr: torch.Tensor | None = None
+    # SketchSSM: window position of each decode row, then the fields of
+    # BaseMambaAttentionMetadata.
+    sketchssm_window_pos_d: torch.Tensor | None = None
+    sketch_meta_d: torch.Tensor | None = None
+    sketch_flush_rows_d: torch.Tensor | None = None
+    sketch_meta_p: torch.Tensor | None = None
+    sketch_build_p: torch.Tensor | None = None
+    # The prefill rows that complete their prompt, then -1.
+    sketch_build_rows_p: torch.Tensor | None = None
+    # False when no decode row flushes this step (never for full CUDA graphs).
+    sketch_has_flush_rows: bool = True
 
 
 class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]):
@@ -143,6 +160,19 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             self.decode_cudagraph_max_bs = min(
                 self.decode_cudagraph_max_bs,
                 self.compilation_config.max_cudagraph_capture_size,
+            )
+
+        self.use_sketchssm = vllm_config.cache_config.sketchssm is not None
+        self.sketchssm_window = vllm_config.cache_config.replayssm_buffer_len
+        if self.use_sketchssm:
+            self.decode_sketchssm_window_pos_d = torch.empty(
+                (self.decode_cudagraph_max_bs,), dtype=torch.int32, device=device
+            )
+            self.decode_sketch_meta_d = torch.empty(
+                (self.decode_cudagraph_max_bs,), dtype=torch.int32, device=device
+            )
+            self.decode_sketch_flush_rows_d = torch.empty(
+                (self.decode_cudagraph_max_bs,), dtype=torch.int32, device=device
             )
 
         self.spec_state_indices_tensor: torch.Tensor = torch.empty(
@@ -288,6 +318,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 no_prior_state &= m.is_prefilling
             else:
                 no_prior_state = torch.zeros_like(no_prior_state)
+            # SketchSSM runs a one-token prompt tail as a prefill.
+            if self.use_sketchssm and m.is_prefilling is not None:
+                no_prior_state |= m.is_prefilling
             num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
                 split_decodes_and_prefills(
                     m.replace(is_prefilling=no_prior_state),
@@ -307,6 +340,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             non_spec_token_indx = None
             spec_state_indices_tensor = None
             non_spec_state_indices_tensor = block_table_tensor[:, 0]
+            if self.use_sketchssm:
+                # The SketchSSM kernels read contiguous slots.
+                non_spec_state_indices_tensor = (
+                    non_spec_state_indices_tensor.contiguous()
+                )
             spec_query_start_loc = None
             non_spec_query_start_loc = query_start_loc
             non_spec_query_start_loc_cpu = query_start_loc_cpu
@@ -538,7 +576,49 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             num_accepted_tokens = self.num_accepted_tokens[:batch_size]
             num_accepted_tokens[num_spec_decodes:].fill_(1)
 
+        sketchssm_window_pos_d = sketch_meta_d = sketch_flush_rows_d = None
+        sketch_meta_p = sketch_build_p = sketch_build_rows_p = None
+        sketch_has_flush_rows = True
+        if self.use_sketchssm and spec_sequence_masks is None and num_decodes > 0:
+            num_computed, decode_base, _ = replayssm_decode_rows(m, num_decodes)
+            decode_steps = (num_computed - decode_base).clamp_min(0)
+            window_pos_cpu = torch.remainder(decode_steps, self.sketchssm_window)
+            sketchssm_window_pos_d = async_tensor_h2d(
+                window_pos_cpu.to(torch.int32).tolist(),
+                dtype=torch.int32,
+                device=query_start_loc.device,
+            )
+            is_flush_cpu = window_pos_cpu == self.sketchssm_window - 1
+            sketch_has_flush_rows = bool(is_flush_cpu.any())
+            sketch_meta_d, sketch_flush_rows_d = sketch_decode_rows(
+                m, num_decodes, is_flush_cpu
+            )
+        if self.use_sketchssm and spec_sequence_masks is None and num_prefills > 0:
+            sketch_meta_p, sketch_build_p = sketch_prefill_rows(
+                m, num_decodes, m.num_reqs
+            )
+            sketch_build_rows_p = sketch_prefill_build_rows(m, num_decodes, m.num_reqs)
+
         if self._stage_decode(num_prefills, num_decodes, num_spec_decodes):
+            sketch_has_flush_rows = True
+            if sketchssm_window_pos_d is not None:
+                self.decode_sketchssm_window_pos_d[:num_decodes].copy_(
+                    sketchssm_window_pos_d, non_blocking=True
+                )
+                sketchssm_window_pos_d = self.decode_sketchssm_window_pos_d[:batch_size]
+                sketchssm_window_pos_d[num_decodes:] = 0
+            if sketch_meta_d is not None:
+                assert sketch_flush_rows_d is not None
+                self.decode_sketch_meta_d[:num_decodes].copy_(
+                    sketch_meta_d, non_blocking=True
+                )
+                sketch_meta_d = self.decode_sketch_meta_d[:batch_size]
+                sketch_meta_d[num_decodes:] = 0
+                self.decode_sketch_flush_rows_d[:num_decodes].copy_(
+                    sketch_flush_rows_d, non_blocking=True
+                )
+                sketch_flush_rows_d = self.decode_sketch_flush_rows_d[:batch_size]
+                sketch_flush_rows_d[num_decodes:] = -1
             self.non_spec_state_indices_tensor[:num_decodes].copy_(
                 non_spec_state_indices_tensor, non_blocking=True
             )
@@ -582,6 +662,13 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             nums_dict=nums_dict,
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,
+            sketchssm_window_pos_d=sketchssm_window_pos_d,
+            sketch_meta_d=sketch_meta_d,
+            sketch_flush_rows_d=sketch_flush_rows_d,
+            sketch_meta_p=sketch_meta_p,
+            sketch_build_p=sketch_build_p,
+            sketch_build_rows_p=sketch_build_rows_p,
+            sketch_has_flush_rows=sketch_has_flush_rows,
         )
         return attn_metadata
 

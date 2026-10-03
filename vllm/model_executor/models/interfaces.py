@@ -99,6 +99,7 @@ MambaStateShapes: TypeAlias = (
         tuple[int, int],
         tuple[int, int, int],
     ]
+    | tuple[tuple[int, ...], ...]
 )
 
 
@@ -1189,6 +1190,27 @@ def supports_replayssm(
     model: type[object] | object,
 ) -> TypeIs[type[SupportsReplaySSM]] | TypeIs[SupportsReplaySSM]:
     return getattr(model, "supports_replayssm", False)
+
+
+@runtime_checkable
+class SupportsSketchSSM(Protocol):
+    """The interface for models that support SketchSSM decode (experimental)."""
+
+    supports_sketchssm: ClassVar[Literal[True]] = True
+
+
+@overload
+def supports_sketchssm(model: type[object]) -> TypeIs[type[SupportsSketchSSM]]: ...
+
+
+@overload
+def supports_sketchssm(model: object) -> TypeIs[SupportsSketchSSM]: ...
+
+
+def supports_sketchssm(
+    model: type[object] | object,
+) -> TypeIs[type[SupportsSketchSSM]] | TypeIs[SupportsSketchSSM]:
+    return getattr(model, "supports_sketchssm", False)
 
 
 @runtime_checkable

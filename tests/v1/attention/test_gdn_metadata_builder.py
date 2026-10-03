@@ -7,6 +7,7 @@ Covers the fix for https://github.com/vllm-project/vllm/issues/34845.
 
 from dataclasses import dataclass
 
+import numpy as np
 import pytest
 import torch
 
@@ -484,3 +485,29 @@ def test_update_block_table_regathers_checkpoint(num_spec):
     assert not torch.equal(
         actual.checkpoint.state_indices, source.checkpoint.state_indices
     )
+
+
+def test_sketchssm_window_pos_and_prompt_tail():
+    """SketchSSM window positions; a one-token prompt tail is a prefill."""
+    builder = _create_gdn_builder(full_cuda_graph=True)
+    builder.vllm_config.cache_config.sketchssm = "unused.pt"
+    builder = GDNAttentionMetadataBuilder(
+        kv_cache_spec=builder.kv_cache_spec,
+        layer_names=["layer.0"],
+        vllm_config=builder.vllm_config,
+        device=DEVICE,
+    )
+    batch = BatchSpec(seq_lens=[106, 117, 50], query_lens=[1, 1, 1])
+    common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE).replace(
+        is_prefilling=torch.tensor([False, False, True]),
+        replayssm_decode_base_cpu=torch.tensor([100, 100, 0], dtype=torch.int32),
+        req_idx=np.array([4, 1, 6]),
+    )
+    meta = builder.build(common_prefix_len=0, common_attn_metadata=common)
+
+    assert (meta.num_decodes, meta.num_prefills) == (2, 1)
+    assert meta.sketchssm_window_pos_d.tolist() == [5, 0]
+    assert meta.sketch_meta_d.tolist() == [4, 1]
+    assert meta.sketch_flush_rows_d.tolist() == [-1, -1]
+    assert not meta.sketch_has_flush_rows
+    assert meta.sketch_meta_p.tolist() == [6]

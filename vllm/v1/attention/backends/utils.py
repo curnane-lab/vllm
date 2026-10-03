@@ -796,6 +796,25 @@ def split_decodes_prefills_and_extends(
     )
 
 
+def replayssm_decode_rows(
+    common_attn_metadata: CommonAttentionMetadata, num_decodes: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """CPU (num_computed, ring_origin, query_len) of the leading decode rows."""
+    decode_base_cpu = common_attn_metadata.replayssm_decode_base_cpu
+    seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
+    if decode_base_cpu is None or seq_lens_cpu is None:
+        raise ValueError(
+            "ReplaySSM and SketchSSM require exact CPU sequence lengths and "
+            "decode-base counts to derive decode ring positions"
+        )
+    query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+    query_lens_cpu = (
+        query_start_loc_cpu[1 : num_decodes + 1] - query_start_loc_cpu[:num_decodes]
+    )
+    num_computed_cpu = seq_lens_cpu[:num_decodes] - query_lens_cpu
+    return num_computed_cpu, decode_base_cpu[:num_decodes], query_lens_cpu
+
+
 def split_decodes_and_prefills(
     common_attn_metadata: CommonAttentionMetadata,
     decode_threshold: int = 1,

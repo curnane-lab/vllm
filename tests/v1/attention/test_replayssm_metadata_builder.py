@@ -7,6 +7,7 @@ per-request ring origin (replayssm_decode_base) and num_computed.
 
 from dataclasses import dataclass
 
+import numpy as np
 import pytest
 import torch
 
@@ -19,6 +20,7 @@ from tests.v1.attention.utils import (
 from vllm.config import SpeculativeConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.config.mamba import MambaBackendEnum
+from vllm.v1.attention.backends.mamba_attn import sketch_prefill_build_rows
 from vllm.v1.kv_cache_interface import MambaSpec
 
 BLOCK_SIZE = 16
@@ -220,13 +222,16 @@ def _create_replayssm_builder(
     *,
     mamba_backend: MambaBackendEnum = MambaBackendEnum.TRITON,
     num_speculative_tokens: int = 0,
+    sketchssm: bool = False,
 ) -> MockMambaBuilder:
     vllm_config = create_vllm_config(
         model_name="Qwen/Qwen3.5-0.8B", block_size=BLOCK_SIZE
     )
     # Set the flags after construction to skip validate_mamba_cached_kernel
     # (it requires a real SupportsReplaySSM model) on the mock model.
-    vllm_config.cache_config.use_replayssm = True
+    vllm_config.cache_config.use_replayssm = not sketchssm
+    if sketchssm:
+        vllm_config.cache_config.sketchssm = "unused.pt"
     vllm_config.cache_config.replayssm_buffer_len = buffer_len
     vllm_config.cache_config.mamba_cache_mode = mamba_cache_mode
     vllm_config.mamba_config.backend = mamba_backend
@@ -344,3 +349,26 @@ def test_flashinfer_replayssm_state_indices_are_stable_for_full_cudagraph():
     assert second_indices is not None
     assert second_indices.data_ptr() == first_ptr
     assert torch.equal(second_indices, second.state_indices_tensor_d[:, 0])
+
+
+def test_sketchssm_metadata():
+    """--sketchssm alone builds the ring and sketch metadata."""
+    builder = _create_replayssm_builder(16, sketchssm=True)
+    assert builder.use_window_rings and not builder.use_replayssm
+    # A flushing decode row, a completing prompt and a chunked prompt.
+    batch = BatchSpec(seq_lens=[116, 100, 60], query_lens=[1, 50, 20])
+    common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE).replace(
+        is_prefilling=torch.tensor([False, True, True]),
+        replayssm_decode_base_cpu=torch.tensor([100, 100, 120], dtype=torch.int32),
+        req_idx=np.array([7, 3, 5]),
+    )
+    meta = builder.build(0, common)
+
+    assert meta.num_decodes == 1 and meta.num_prefills == 2
+    assert meta.write_pos_d.tolist()[:1] == [15]
+    assert meta.is_flush_d.tolist()[:1] == [1]
+    assert meta.sketch_meta_d.tolist()[:1] == [7]
+    assert meta.sketch_flush_rows_d.tolist()[:1] == [0]
+    assert meta.sketch_meta_p.tolist() == [3, 5]
+    assert meta.sketch_build_p.tolist() == [1, 0]
+    assert sketch_prefill_build_rows(common, 1, 3).tolist() == [0, -1]

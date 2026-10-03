@@ -195,6 +195,8 @@ def test_kda_recoverssm_startup_metadata_flow_without_model(monkeypatch):
         ),
         cache_config=SimpleNamespace(
             mamba_cache_mode="align",
+            replayssm_buffer_len=16,
+            sketchssm=None,
             use_kda_recoverssm=True,
             prefix_match_unit=None,
         ),

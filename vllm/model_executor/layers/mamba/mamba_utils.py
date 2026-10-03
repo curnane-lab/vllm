@@ -4,7 +4,7 @@
 import functools
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal, TypeAlias
+from typing import TYPE_CHECKING, Literal, TypeAlias
 
 import torch
 
@@ -19,6 +19,9 @@ from vllm.utils.torch_utils import (
     get_kv_cache_torch_dtype,
 )
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
 
 logger = init_logger(__name__)
 
@@ -48,6 +51,11 @@ def get_conv_state_layout() -> ConvStateLayoutType:
 def is_conv_state_dim_first() -> bool:
     """True when the conv state is stored as (dim, state_len) per block."""
     return get_conv_state_layout() == "DS"
+
+
+def _num_spec(vllm_config: "VllmConfig") -> int:
+    spec_config = vllm_config.speculative_config
+    return spec_config.num_speculative_tokens if spec_config else 0
 
 
 class MambaStateDtypeCalculator:
@@ -130,6 +138,31 @@ class MambaStateDtypeCalculator:
         )
 
     @classmethod
+    def gated_delta_net_state_dtype_from_config(
+        cls, vllm_config: "VllmConfig"
+    ) -> tuple[torch.dtype, ...]:
+        dtypes = cls.gated_delta_net_state_dtype(
+            vllm_config.model_config.dtype,
+            vllm_config.cache_config.mamba_cache_dtype,
+            vllm_config.cache_config.mamba_ssm_cache_dtype,
+        )
+        if vllm_config.cache_config.sketchssm is not None:
+            dtypes = cls.append_gdn_sketchssm_ring(
+                dtypes, vllm_config.model_config.dtype
+            )
+        return dtypes
+
+    @classmethod
+    def append_gdn_sketchssm_ring(
+        cls,
+        base_dtypes: tuple[torch.dtype, ...],
+        model_dtype: ModelDType | torch.dtype,
+    ) -> tuple[torch.dtype, ...]:
+        """Append the dtypes of the GDN SketchSSM rings ``(d, k, g)``."""
+        activation_dtype = get_kv_cache_torch_dtype("auto", model_dtype)
+        return (*base_dtypes, activation_dtype, activation_dtype, torch.float32)
+
+    @classmethod
     def kda_state_dtype(
         cls,
         model_dtype: ModelDType | torch.dtype,
@@ -147,6 +180,29 @@ class MambaStateDtypeCalculator:
                 f"got {mamba_ssm_cache_dtype}"
             )
         return (conv_state_dtype, recurrent_state_dtype)
+
+    @classmethod
+    def kda_state_dtype_from_config(
+        cls, vllm_config: "VllmConfig"
+    ) -> tuple[torch.dtype, ...]:
+        dtypes = cls.kda_state_dtype(
+            vllm_config.model_config.dtype, vllm_config.cache_config.mamba_cache_dtype
+        )
+        if vllm_config.cache_config.sketchssm is not None:
+            dtypes = cls.append_kda_sketchssm_ring(dtypes)
+        return dtypes
+
+    @classmethod
+    def append_kda_sketchssm_ring(
+        cls, base_dtypes: tuple[torch.dtype, ...]
+    ) -> tuple[torch.dtype, ...]:
+        """Append the dtypes of the KDA SketchSSM window rings."""
+        from vllm.model_executor.layers.mamba.ops.kda_sketchssm_common import (
+            kda_sketch_ring_specs,
+        )
+
+        specs = kda_sketch_ring_specs(1).values()
+        return (*base_dtypes, *(dtype for _, dtype in specs))
 
     @classmethod
     def append_kda_recoverssm_record(
@@ -301,6 +357,51 @@ class MambaStateShapeCalculator:
         return conv_state_shape, temporal_state_shape
 
     @classmethod
+    def gated_delta_net_state_shape_from_config(
+        cls, vllm_config: "VllmConfig"
+    ) -> tuple[tuple[int, ...], ...]:
+        hf_config = vllm_config.model_config.hf_text_config
+        tp_size = vllm_config.parallel_config.tensor_parallel_size
+        args = (
+            tp_size,
+            hf_config.linear_num_key_heads,
+            hf_config.linear_num_value_heads,
+            hf_config.linear_key_head_dim,
+            hf_config.linear_value_head_dim,
+        )
+        shapes = cls.gated_delta_net_state_shape(
+            *args, hf_config.linear_conv_kernel_dim, _num_spec(vllm_config)
+        )
+        cache_config = vllm_config.cache_config
+        if cache_config.sketchssm is not None:
+            shapes = cls.append_gdn_sketchssm_ring(
+                shapes, *args, cache_config.replayssm_buffer_len
+            )
+        return shapes
+
+    @classmethod
+    def append_gdn_sketchssm_ring(
+        cls,
+        base_shapes: tuple[tuple[int, ...], ...],
+        tp_world_size: int,
+        num_k_heads: int,
+        num_v_heads: int,
+        head_k_dim: int,
+        head_v_dim: int,
+        ring_len: int,
+    ) -> tuple[tuple[int, ...], ...]:
+        """Append the shapes of the GDN SketchSSM rings: ``d (HV, L, V)``,
+        ``k (H, L, K)`` and ``g (HV, L)``."""
+        local_v_heads = divide(num_v_heads, tp_world_size)
+        local_k_heads = divide(num_k_heads, tp_world_size)
+        return (
+            *base_shapes,
+            (local_v_heads, ring_len, head_v_dim),
+            (local_k_heads, ring_len, head_k_dim),
+            (local_v_heads, ring_len),
+        )
+
+    @classmethod
     def kda_state_shape(
         cls,
         tp_world_size: int,
@@ -325,6 +426,44 @@ class MambaStateShapeCalculator:
         )
         recurrent_state_shape = (divide(num_heads, tp_world_size), head_dim, head_dim)
         return (conv_state_shape, recurrent_state_shape)
+
+    @classmethod
+    def kda_state_shape_from_config(
+        cls, vllm_config: "VllmConfig"
+    ) -> tuple[tuple[int, ...], ...]:
+        hf_config = vllm_config.model_config.hf_text_config
+        cache_config = vllm_config.cache_config
+        tp_size = vllm_config.parallel_config.tensor_parallel_size
+        num_heads, head_dim = hf_config.linear_num_heads, hf_config.linear_head_dim
+        shapes: tuple[tuple[int, ...], ...] = cls.kda_state_shape(
+            tp_size,
+            num_heads,
+            head_dim,
+            conv_kernel_size=hf_config.linear_conv_kernel_dim,
+            num_spec=_num_spec(vllm_config),
+        )
+        if cache_config.sketchssm is not None:
+            shapes = cls.append_kda_sketchssm_ring(
+                shapes, tp_size, num_heads, cache_config.replayssm_buffer_len
+            )
+        return shapes
+
+    @classmethod
+    def append_kda_sketchssm_ring(
+        cls,
+        base_shapes: tuple[tuple[int, ...], ...],
+        tp_world_size: int,
+        num_heads: int,
+        window: int = 16,
+    ) -> tuple[tuple[int, ...], ...]:
+        """Append the shapes of the KDA SketchSSM window rings."""
+        from vllm.model_executor.layers.mamba.ops.kda_sketchssm_common import (
+            kda_sketch_ring_specs,
+        )
+
+        local_heads = divide(num_heads, tp_world_size)
+        specs = kda_sketch_ring_specs(local_heads, window).values()
+        return (*base_shapes, *(shape for shape, _ in specs))
 
     @classmethod
     def append_kda_recoverssm_record(
