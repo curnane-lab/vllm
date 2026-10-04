@@ -43,13 +43,16 @@ def gdn_sketch_layout(
     for m in ranks.tolist():
         if not 0 <= m <= k:
             raise ValueError(f"GDN sketch rank {m} outside [0, {k}]")
-        fg = max(4, (m + 3) // 4 * 4)
+        # AscendC vector ops require 32-byte-aligned row starts; pad the
+        # feature grain to 16 bf16 elements so every packed row (fs at fg
+        # stride, phi gains at (p+1)*fg) is 32B-aligned in UB.
+        fg = max(16, (m + 15) // 16 * 16)
         rows.append((nu, nm, nf, fg))
         nu += m * k
         nm += 0 if m in (0, k) else m * k if m <= p else p * k + (p + 1) * fg
         nf += window * fg if m else 0
-    # Rows are staged with 16-byte copies.
-    sizes = tuple(max(8, (n + 7) // 8 * 8) for n in (nu, nm, nf))
+    # Rows are staged with 32-byte copies.
+    sizes = tuple(max(16, (n + 15) // 16 * 16) for n in (nu, nm, nf))
     return torch.tensor(rows, dtype=torch.int32), sizes
 
 
