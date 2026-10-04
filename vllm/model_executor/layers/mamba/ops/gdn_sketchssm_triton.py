@@ -532,6 +532,18 @@ def gdn_sketch_triton_decode(
         *state.stride()[:3], *d_cache.stride()[:3], *k_cache.stride()[:3],
         *g_cache.stride()[:2], s.u.stride(0),
     )  # fmt: skip
+    ascend_done = False
+    if (os.environ.get("SKETCHSSM_ASCENDC", "0") == "1"
+            and current_platform.device_type == "npu"):
+        from vllm.model_executor.layers.mamba.ops.gdn_sketch_step_ascend import (
+            gdn_sketch_ascend_step,
+        )
+        ascend_done = gdn_sketch_ascend_step(
+            mixed_qkv, a, b, A_log, dt_bias, out, state, d_cache, k_cache,
+            g_cache, slots, write_pos, meta, s, scale)
+        if ascend_done and not has_flush_rows:
+            return
+
     two_phase = (os.environ.get("SKETCHSSM_TWO_PHASE", "1") == "1"
                  and batch >= 128)
     if two_phase:
