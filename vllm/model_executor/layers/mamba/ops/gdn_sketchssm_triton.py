@@ -546,7 +546,9 @@ def gdn_sketch_triton_decode(
 
     two_phase = (os.environ.get("SKETCHSSM_TWO_PHASE", "1") == "1"
                  and batch >= 128)
-    if two_phase:
+    if ascend_done:
+        pass  # step handled by the AscendC kernel; run flush/build below
+    elif two_phase:
         cap = triton.next_power_of_2(t.rank_cap)
         # Persistent scratch: one buffer per (batch, hv, cap), reused across
         # layers and steps. Write-before-read within a step, so reuse is safe
