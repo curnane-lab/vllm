@@ -25,3 +25,5 @@ SketchSSM currently supports NemotronH (`NemotronHForCausalLM`) models. It requi
 Mamba prefix caching works in align mode (`--mamba-cache-mode align`), as with the default decode. Tensor parallelism splits the heads, their ranks and the group frames across ranks (the tensor-parallel size must divide the heads, and the groups unless there is a single group). Speculative decoding, stochastic rounding of the SSM state and KV connectors are not supported yet.
 
 Mamba-2 layers need a power-of-two state size of at least 16 and a head dim of at least 16.
+
+The Ascend NPU backend lives in [vllm-ascend](https://github.com/vllm-project/vllm-ascend): its Triton kernels and layer replace the CUDA ones through a worker patch, and require Model Runner V2, `--mamba-backend triton` and `--mamba-ssm-cache-dtype float32`, without tensor parallelism or prefix caching. See the vllm-ascend documentation for the supported models and installation.

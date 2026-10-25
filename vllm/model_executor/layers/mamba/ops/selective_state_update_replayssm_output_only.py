@@ -583,7 +583,10 @@ def selective_state_update_replayssm_output_only(
     fl_nds = triton.cdiv(bs_dstate, fl_dstate_tile)
     # AMD Triton does not support tf32x3, so use its backend default. CUDA
     # retains tf32x3 to preserve fp32 parity with the elementwise baseline.
-    dot_input_precision = None if current_platform.is_rocm() else "tf32x3"
+    dot_input_precision = (
+        "ieee" if current_platform.device_type == "npu"
+        else None if current_platform.is_rocm() else "tf32x3"
+    )
 
     grid = lambda META: (triton.cdiv(dim, META["BLOCK_SIZE_M"]), batch, nheads)
     z_strides = (z.stride(0), z.stride(1), z.stride(2)) if z is not None else (0, 0, 0)
